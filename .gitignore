@@ -29,3 +29,8 @@ test-*.cjs
 test-*.js
 !src/**/*.js
 .playwright-mcp/
+
+# Local secrets & cached raw Space-Track pulls (never commit)
+.env.local
+.cache-spacetrack/
+HANDOFF.md

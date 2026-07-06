@@ -206,17 +206,20 @@ export function eciToGeodetic(eciPos, gmst) {
  */
 export function eciToThreeJs(eciPos, earthRadiusKm = EARTH_RADIUS_KM) {
   const scale = 1.0 / earthRadiusKm;
+  // Proper right-handed rotation (−90° about X): ECI Z (north) -> Three Y (up),
+  // ECI X -> Three X, ECI Y -> Three −Z. Negating Y preserves handedness so
+  // prograde orbits, inclinations and the transfer arc all read correctly.
   return {
     x: eciPos.x * scale,
-    y: eciPos.z * scale, // ECI Z -> Three.js Y (up)
-    z: eciPos.y * scale, // ECI Y -> Three.js Z
+    y: eciPos.z * scale,  // ECI Z -> Three.js Y (up)
+    z: -eciPos.y * scale, // ECI Y -> Three.js -Z (right-handed)
   };
 }
 
 // ─── Moon Position Cache ────────────────────────────────────────────────────────
 
 const _moonPosCache = new Map();
-const MOON_CACHE_RESOLUTION_MS = 600000; // 10-minute resolution is fine for trajectory
+const MOON_CACHE_RESOLUTION_MS = 10000; // 10-second resolution: accurate near the SOI / lunar approach
 
 function getMoonPositionCached(date) {
   const key = Math.floor(date.getTime() / MOON_CACHE_RESOLUTION_MS);

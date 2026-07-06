@@ -25,10 +25,14 @@ const CATEGORY_COLORS = {
   rocket_body: 0xff8c00,
   iss: 0xffd700,
   starlink: 0x00bfff,
+  oneweb: 0x22d3ee,
+  iridium: 0x14b8a6,
   gps: 0x32cd32,
+  glonass: 0xff6347,
+  galileo: 0xa3e635,
+  beidou: 0xf472b6,
   weather: 0x87ceeb,
   station: 0xffd700,
-  glonass: 0xff6347,
 };
 
 function getCategoryColorHex(category) {
@@ -43,7 +47,11 @@ const CATEGORY_POINT_SIZES = {
   satellite: 1.5,
   gps: 2.5,
   glonass: 2.5,
+  galileo: 2.5,
+  beidou: 2.5,
   starlink: 1.0,
+  oneweb: 1.0,
+  iridium: 1.5,
   debris: 1.0,
   'rocket body': 1.5,
   rocket_body: 1.5,
@@ -767,13 +775,20 @@ export class LunarScene {
       groups.get(cat).push(obj);
     }
 
+    // Parallel array: for each category, the global catalog index of each item,
+    // so worker position buffers (indexed by catalog index) can be scattered in.
+    this._orbitalCategoryGidx = this._orbitalCategoryGidx || new Map();
+
     for (const [category, items] of groups) {
       const positions = new Float32Array(items.length * 3);
+      const gidx = new Int32Array(items.length);
       for (let i = 0; i < items.length; i++) {
         positions[i * 3] = items[i].position.x;
         positions[i * 3 + 1] = items[i].position.y;
         positions[i * 3 + 2] = items[i].position.z;
+        gidx[i] = items[i].idx != null ? items[i].idx : -1;
       }
+      this._orbitalCategoryGidx.set(category, gidx);
 
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
@@ -897,6 +912,29 @@ export class LunarScene {
    */
   updateOrbitalObjects(positionsMap) {
     this.updateOrbitalPositions(positionsMap);
+  }
+
+  /**
+   * Fast path: scatter a worker-produced position buffer (Float32Array indexed by
+   * global catalog index) into each category's geometry using the precomputed gidx.
+   * @param {Float32Array} buf
+   */
+  updateFromBuffer(buf) {
+    if (!this._orbitalCategoryGidx) return;
+    for (const [category, points] of this._orbitalMeshes) {
+      const gidx = this._orbitalCategoryGidx.get(category);
+      if (!gidx) continue;
+      const posAttr = points.geometry.getAttribute('position');
+      const arr = posAttr.array;
+      for (let i = 0; i < gidx.length; i++) {
+        const g = gidx[i];
+        if (g < 0) continue;
+        arr[i * 3] = buf[g * 3];
+        arr[i * 3 + 1] = buf[g * 3 + 1];
+        arr[i * 3 + 2] = buf[g * 3 + 2];
+      }
+      posAttr.needsUpdate = true;
+    }
   }
 
   /**
@@ -1615,9 +1653,8 @@ export class LunarScene {
       this._earthMaterial.uniforms.sunDirection.value.copy(this.sunLight.position).normalize();
     }
 
-    // Smooth Keplerian propagation for SATCAT objects every frame
-    const simTimeSec = Date.now() / 1000;
-    this.updateKeplerianPositions(simTimeSec);
+    // Orbital object positions are updated from the propagation worker (see main.js),
+    // not re-propagated on the render thread.
 
     // Per-frame external propagation callback (SGP4 from main.js)
     if (this._onBeforeRenderCallback) {

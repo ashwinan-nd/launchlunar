@@ -46,14 +46,18 @@ const MOON_TARGETS = [
 
 const CATEGORY_DISPLAY = [
   { key: 'satellite', label: 'Satellites', color: '#AA66FF' },
+  { key: 'starlink', label: 'Starlink', color: '#00BFFF' },
+  { key: 'oneweb', label: 'OneWeb', color: '#22D3EE' },
+  { key: 'iridium', label: 'Iridium', color: '#14B8A6' },
   { key: 'debris', label: 'Debris', color: '#FF4444' },
   { key: 'rocket_body', label: 'Rocket Bodies', color: '#FF8C00' },
-  { key: 'starlink', label: 'Starlink', color: '#00BFFF' },
   { key: 'gps', label: 'GPS', color: '#32CD32' },
-  { key: 'iss', label: 'ISS', color: '#FFD700' },
-  { key: 'weather', label: 'Weather', color: '#87CEEB' },
-  { key: 'station', label: 'Space Stations', color: '#FFD700' },
   { key: 'glonass', label: 'GLONASS', color: '#FF6347' },
+  { key: 'galileo', label: 'Galileo', color: '#A3E635' },
+  { key: 'beidou', label: 'BeiDou', color: '#F472B6' },
+  { key: 'weather', label: 'Weather', color: '#87CEEB' },
+  { key: 'iss', label: 'ISS', color: '#FFD700' },
+  { key: 'station', label: 'Space Stations', color: '#FFD700' },
 ];
 
 const MISSION_PHASES = [
@@ -80,72 +84,14 @@ const SPEED_OPTIONS = [0.5, 1, 2, 5];
 const REPROPAGATION_INTERVAL_MS = 5000;
 
 // ---------------------------------------------------------------------------
-// SATCAT Data Loader — loads 34k+ orbital objects from public/data/satcat.json
+// Real catalog loader — full Space-Track GP catalog (public/data/catalog.json)
+// Each entry carries real TLE lines for genuine SGP4 propagation.
 // ---------------------------------------------------------------------------
 
-async function loadSATCATData() {
-  try {
-    const resp = await fetch('/data/satcat.json');
-    const objects = await resp.json();
-    const results = [];
-    for (const obj of objects) {
-      const apogee = obj.APOGEE || 0;
-      const perigee = obj.PERIGEE || 0;
-      const period = obj.PERIOD || 0;
-      if (apogee <= 0 || perigee <= 0 || period <= 0) continue; // skip invalid
-      
-      const altKm = (apogee + perigee) / 2;
-      if (altKm < 100 || altKm > 100000) continue; // skip unrealistic altitudes
-      
-      const radius = (6371 + altKm) / 6371;
-      const inclRad = (obj.INCLINATION || 0) * Math.PI / 180;
-      const raan = Math.random() * Math.PI * 2;
-      const trueAnomaly = Math.random() * Math.PI * 2;
-      
-      const cosI = Math.cos(inclRad), sinI = Math.sin(inclRad);
-      const cosR = Math.cos(raan), sinR = Math.sin(raan);
-      const cosV = Math.cos(trueAnomaly), sinV = Math.sin(trueAnomaly);
-      
-      const x = radius * (cosR * cosV - sinR * sinV * cosI);
-      const y = radius * sinV * sinI;
-      const z = radius * (sinR * cosV + cosR * sinV * cosI);
-      
-      if (isNaN(x) || isNaN(y) || isNaN(z)) continue; // skip NaN positions
-      
-      const name = (obj.OBJECT_NAME || '').toUpperCase();
-      let category = 'satellite';
-      if (name.includes('DEB')) category = 'debris';
-      else if (name.includes('R/B')) category = 'rocket_body';
-      else if (name.includes('STARLINK')) category = 'starlink';
-      else if (name.includes('GPS') || name.includes('NAVSTAR')) category = 'gps';
-      else if (name.includes('GLONASS') || name.includes('COSMOS 2')) category = 'glonass';
-      else if (name.includes('ONEWEB')) category = 'oneweb';
-      else if (name.includes('IRIDIUM')) category = 'iridium';
-      else if (name.includes('NOAA') || name.includes('GOES') || name.includes('METEOSAT')) category = 'weather';
-      else if (name.includes('TIANGONG') || name.includes('STATION')) category = 'station';
-      
-      results.push({
-        id: String(obj.NORAD_CAT_ID),
-        name: obj.OBJECT_NAME,
-        category,
-        position: { x, y, z },
-        size: 0.02,
-        keplerian: {
-          semiMajorAxis: 6371 + altKm,
-          inclination: inclRad,
-          raan,
-          trueAnomaly,
-          period: period * 60,
-          meanMotion: 2 * Math.PI / (period * 60),
-          epoch: Date.now() / 1000
-        }
-      });
-    }
-    return results;
-  } catch (e) {
-    console.warn('SATCAT load failed:', e);
-    return [];
-  }
+async function loadCatalog() {
+  const resp = await fetch('/data/catalog.json');
+  if (!resp.ok) throw new Error(`catalog.json ${resp.status}`);
+  return resp.json();
 }
 
 // ---------------------------------------------------------------------------
@@ -1888,7 +1834,7 @@ function updateInfoPanel(panel) {
   panel.innerHTML = '';
   panel.appendChild(el('div', { className: 'info-panel-objects' }, `Objects: ${state.totalObjects.toLocaleString()}`));
   panel.appendChild(el('div', { className: 'info-panel-clock' }, timeStr));
-  panel.appendChild(el('div', { className: 'info-panel-source' }, 'Sources: CelesTrak + N2YO + SATCAT'));
+  panel.appendChild(el('div', { className: 'info-panel-source' }, 'Source: Space-Track GP (SGP4)'));
 }
 
 // ---------------------------------------------------------------------------
@@ -1928,128 +1874,78 @@ async function loadInitialOrbitalData() {
 
   const now = new Date();
 
-  // Fetch CelesTrak TLE data + N2YO data + SATCAT data in parallel
-  const [celestrakResult, n2yoResult, satcatResult] = await Promise.allSettled([
-    fetchTLEData({
-      onProgress: ({ completed, total }) => {
-        // Silent background loading
-      },
-      timeoutMs: 20000,
-    }),
-    fetchN2YOData(15000),
-    loadSATCATData(),
-  ]);
-
-  let processedData = (celestrakResult.status === 'fulfilled') ? celestrakResult.value : [];
-  const n2yoData = (n2yoResult.status === 'fulfilled') ? n2yoResult.value : [];
-  const satcatData = (satcatResult.status === 'fulfilled') ? satcatResult.value : [];
-
-  // Ensure fallback data if CelesTrak fails
-  if (!processedData || processedData.length < 20) {
-    console.warn('Insufficient CelesTrak data, merging fallback TLE data');
-    const fallbackProcessed = processGPData(
-      FALLBACK_TLE_DATA.map((gp) => ({ gp, sourceGroup: gp._sourceGroup || 'fallback' }))
-    );
-    const existingIds = new Set((processedData || []).map(o => o.id));
-    for (const fb of fallbackProcessed) {
-      if (!existingIds.has(fb.id)) {
-        processedData.push(fb);
-      }
-    }
+  // Load the full real Space-Track catalog (every entry has real TLE lines).
+  let catalog;
+  try {
+    catalog = await loadCatalog();
+  } catch (e) {
+    console.error('[data] catalog load failed:', e);
+    return;
   }
+  state.catalog = catalog;
+  state.orbitalData = catalog; // reused by the launch pipeline for conjunction screening
 
-  state.orbitalData = processedData;
-
-  // Build set of CelesTrak NORAD IDs for deduplication against N2YO
-  const celestrakIds = new Set(processedData.map(o => o.id));
-
-  // Propagate CelesTrak objects and build satrec map
+  // Seed initial positions with a single synchronous SGP4 pass (the worker takes
+  // over continuous propagation immediately after). Objects that fail to parse or
+  // propagate are dropped from the render set entirely.
   const orbitalObjects = [];
   const categoryCounts = {};
-
-  for (const obj of processedData) {
-    if (!obj.tle.line1 || !obj.tle.line2) continue;
-
+  let parseOk = 0;
+  for (let i = 0; i < catalog.length; i++) {
+    const obj = catalog[i];
+    let pos3;
     try {
-      const result = parseTleAndPropagate(obj.tle.line1, obj.tle.line2, now);
-      if (!result.position) continue;
-
-      // Store satrec for re-propagation
-      if (result.satrec) {
-        state.satrecMap.set(obj.id, result.satrec);
-      }
-
-      const pos3 = eciToThreeJs(result.position);
-      let sceneCategory = obj.category;
-      if (sceneCategory === 'rocket_body') sceneCategory = 'rocket body';
-
-      orbitalObjects.push({
-        id: String(obj.id),
-        name: obj.name,
-        category: sceneCategory,
-        position: pos3,
-        size: 0.03,
-      });
-
-      categoryCounts[obj.category] = (categoryCounts[obj.category] || 0) + 1;
+      const satrec = satellite.twoline2satrec(obj.l1, obj.l2);
+      if (!satrec || satrec.error) continue;
+      const pv = satellite.propagate(satrec, now);
+      if (!pv || !pv.position) continue;
+      pos3 = eciToThreeJs(pv.position);
+      if (!isFinite(pos3.x) || !isFinite(pos3.y) || !isFinite(pos3.z)) continue;
+      parseOk++;
     } catch (e) {
-      // Skip failed propagations
+      continue;
     }
-  }
-
-  // Add N2YO objects that aren't in CelesTrak
-  for (const n2yoObj of n2yoData) {
-    if (celestrakIds.has(n2yoObj.id)) continue;
-
-    state.n2yoOnlyIds.add(n2yoObj.id);
-
-    let sceneCategory = n2yoObj.category;
-    if (sceneCategory === 'rocket_body') sceneCategory = 'rocket body';
-
     orbitalObjects.push({
-      id: String(n2yoObj.id),
-      name: n2yoObj.name,
-      category: sceneCategory,
-      position: n2yoObj.position,
+      idx: i,                 // global catalog index (worker buffer alignment)
+      id: obj.id,
+      name: obj.name,
+      category: obj.cat,      // scene lowercases; colors keyed by cat
+      rcs: obj.rcs,
+      position: pos3,
       size: 0.03,
     });
-
-    categoryCounts[n2yoObj.category] = (categoryCounts[n2yoObj.category] || 0) + 1;
+    categoryCounts[obj.cat] = (categoryCounts[obj.cat] || 0) + 1;
   }
 
-  // Merge SATCAT objects (NORAD_CAT_ID dedup — CelesTrak/N2YO take priority)
-  const allExistingIds = new Set(orbitalObjects.map(o => o.id));
-  let satcatAdded = 0;
-  for (const satcatObj of satcatData) {
-    if (allExistingIds.has(satcatObj.id)) continue;
-    allExistingIds.add(satcatObj.id);
-
-    let sceneCategory = satcatObj.category;
-    if (sceneCategory === 'rocket_body') sceneCategory = 'rocket body';
-
-    orbitalObjects.push({
-      id: satcatObj.id,
-      name: satcatObj.name,
-      category: sceneCategory,
-      position: satcatObj.position,
-      size: satcatObj.size,
-      keplerian: satcatObj.keplerian,
-    });
-
-    categoryCounts[satcatObj.category] = (categoryCounts[satcatObj.category] || 0) + 1;
-    satcatAdded++;
-  }
-
-  console.log(`[data] Loaded ${orbitalObjects.length} orbital objects (CelesTrak: ${processedData.length}, N2YO unique: ${state.n2yoOnlyIds.size}, SATCAT unique: ${satcatAdded})`);
+  console.log(`[data] Loaded ${orbitalObjects.length}/${catalog.length} real objects (SGP4 ok: ${parseOk})`);
 
   state.totalObjects = orbitalObjects.length;
   state.categoryCounts = categoryCounts;
   for (const key of Object.keys(categoryCounts)) {
-    state.categoryVisibility[key] = true;
+    if (state.categoryVisibility[key] === undefined) state.categoryVisibility[key] = true;
   }
 
   // Add objects to 3D scene
   scene.addOrbitalObjects(orbitalObjects);
+
+  // ---- Spin up the propagation worker (continuous real SGP4, off main thread) ----
+  try {
+    const worker = new Worker(new URL('./propagation-worker.js', import.meta.url), { type: 'module' });
+    state.propWorker = worker;
+    worker.onmessage = (e) => {
+      const msg = e.data;
+      if (msg.type === 'ready') {
+        console.log(`[worker] propagating ${msg.ok}/${msg.total} objects`);
+      } else if (msg.type === 'positions') {
+        if (state.scene) state.scene.updateFromBuffer(msg.buf);
+      }
+    };
+    // Transfer only the fields the worker needs.
+    const workerCatalog = catalog.map((o) => ({ l1: o.l1, l2: o.l2 }));
+    worker.postMessage({ type: 'init', catalog: workerCatalog, timeScale: 1, simStartMs: now.getTime() });
+  } catch (e) {
+    console.warn('[worker] failed to start; positions will be static:', e);
+  }
 
   // Position Moon using accurate Meeus ephemeris
   const moonPos = getMoonPosition(now);
@@ -2084,6 +1980,27 @@ async function loadInitialOrbitalData() {
 // ---------------------------------------------------------------------------
 // LAUNCH handler (trajectory computation)
 // ---------------------------------------------------------------------------
+
+// Select a representative subset of the real catalog for conjunction screening.
+// Prioritises larger objects (LARGE/MEDIUM RCS) which dominate real collision risk,
+// then fills with a uniform sample so the screen stays fast but representative.
+function buildScreeningSet(limit = 1500) {
+  const cat = state.catalog || [];
+  const rank = { LARGE: 0, MEDIUM: 1, SMALL: 2 };
+  const sorted = cat
+    .map((o, i) => ({ o, i }))
+    .filter((e) => e.o.l1 && e.o.l2)
+    .sort((a, b) => (rank[a.o.rcs] ?? 3) - (rank[b.o.rcs] ?? 3));
+  const chosen = sorted.slice(0, limit);
+  return chosen.map(({ o }) => ({
+    noradId: String(o.id),
+    name: o.name,
+    line1: o.l1,
+    line2: o.l2,
+    cat: o.cat,
+    rcs: o.rcs,
+  }));
+}
 
 async function handleLaunch() {
   const errorEl = document.getElementById('form-error');
@@ -2120,20 +2037,8 @@ async function handleLaunch() {
       name: values.siteName,
     };
 
-    // Build TLE data subset for collision checking
-    const tleDataForWindows = [];
-    if (state.orbitalData) {
-      for (const obj of state.orbitalData.slice(0, 200)) {
-        if (obj.tle.line1 && obj.tle.line2) {
-          tleDataForWindows.push({
-            noradId: String(obj.id),
-            name: obj.name,
-            line1: obj.tle.line1,
-            line2: obj.tle.line2,
-          });
-        }
-      }
-    }
+    // Build TLE data subset for conjunction screening from the real catalog.
+    const tleDataForWindows = buildScreeningSet();
 
     showSidebarLoading('Finding optimal launch windows...', 40);
     await new Promise((r) => setTimeout(r, 30));
@@ -2341,33 +2246,7 @@ function init() {
   try {
     state.scene = new LunarScene(canvasContainer);
 
-    // Register per-frame SGP4 propagation callback for smooth orbital motion
-    let lastSGP4Frame = 0;
-    state.scene.setOnBeforeRender((elapsed, delta) => {
-      // Propagate SGP4 objects every frame (satellite.js is fast enough for ~3000 objects)
-      if (state.satrecMap.size === 0) return;
-
-      // Throttle slightly to every 2nd frame if needed, but generally fine per-frame
-      const now = new Date();
-      const positionsMap = new Map();
-
-      for (const [id, satrec] of state.satrecMap) {
-        try {
-          const posVel = satellite.propagate(satrec, now);
-          if (posVel.position && posVel.position !== false) {
-            const pos3 = eciToThreeJs(posVel.position);
-            positionsMap.set(String(id), pos3);
-          }
-        } catch (e) {
-          // Skip failed propagations silently
-        }
-      }
-
-      if (positionsMap.size > 0) {
-        state.scene.updateOrbitalPositions(positionsMap);
-      }
-    });
-
+    // Orbital object positions come from the propagation worker (see loadInitialOrbitalData).
     state.scene.animate();
     window.addEventListener('resize', () => {
       if (state.scene) state.scene.onResize();
@@ -2386,6 +2265,9 @@ function init() {
   // ---- Render info panel immediately (will update when data loads) ----
   renderInfoPanel();
 }
+
+// Expose state for verification/debugging.
+window.__state = state;
 
 // Boot
 init();
