@@ -1343,6 +1343,9 @@ function selectWindow(idx, windows, formValues) {
   createRocketMesh(scene);
   positionRocketAtProgress(0);
 
+  // Highlight high-risk conjunction objects for this window.
+  showWindowRisks(scene, w);
+
   // Reset play state
   state.playProgress = 0;
   state.isPlaying = false;
@@ -1360,6 +1363,50 @@ function selectWindow(idx, windows, formValues) {
 // ---------------------------------------------------------------------------
 // Three.js helpers (trajectory curve, tick marks, rocket)
 // ---------------------------------------------------------------------------
+
+// Highlight a window's screened conjunction objects: red markers on the trajectory +
+// a listed high-risk panel in the right sidebar.
+function showWindowRisks(scene, w) {
+  const approaches = (w.closeApproaches || []).slice(0, 10);
+  const markers = approaches.map((a) => {
+    const p = eciToThreeJs(a.rocketPosition);
+    return {
+      pos: p,
+      label: `${a.objectName} · ${a.distanceKm.toFixed(0)} km`,
+      critical: a.severity === 'critical' || a.severity === 'warning',
+    };
+  });
+  scene.showConjunctionMarkers(markers);
+
+  // Sidebar list (replace previous).
+  const panel = document.getElementById('right-sidebar');
+  if (!panel) return;
+  const old = document.getElementById('conjunction-list');
+  if (old) old.remove();
+  const list = el('div', { id: 'conjunction-list', style: { marginTop: '14px' } });
+  list.appendChild(el('div', { className: 'results-header' },
+    `HIGH-RISK CONJUNCTIONS (${approaches.length})`));
+  if (approaches.length === 0) {
+    list.appendChild(el('div', { style: { fontSize: '0.72rem', color: '#5a7' } },
+      'No screened objects within 200 km of the ascent corridor.'));
+  } else {
+    for (const a of approaches) {
+      const col = a.severity === 'critical' ? '#ff5555' : a.severity === 'warning' ? '#ffaa44' : '#8aa';
+      list.appendChild(el('div', {
+        style: {
+          display: 'flex', justifyContent: 'space-between', gap: '8px',
+          fontSize: '0.7rem', padding: '4px 0', borderBottom: '1px solid rgba(255,255,255,0.05)',
+        },
+      },
+        el('span', { style: { color: col, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+          `${a.objectName}${a.cat ? ' (' + a.cat + ')' : ''}`),
+        el('span', { style: { color: col, flexShrink: '0', fontVariantNumeric: 'tabular-nums' } },
+          `${a.distanceKm.toFixed(1)} km`),
+      ));
+    }
+  }
+  panel.appendChild(list);
+}
 
 function buildTrajectoryCurve(scene, trajPoints) {
   const Vec3 = scene.camera.position.constructor;
@@ -1967,7 +2014,7 @@ async function loadInitialOrbitalData() {
 // Select a representative subset of the real catalog for conjunction screening.
 // Prioritises larger objects (LARGE/MEDIUM RCS) which dominate real collision risk,
 // then fills with a uniform sample so the screen stays fast but representative.
-function buildScreeningSet(limit = 1500) {
+function buildScreeningSet(limit = 800) {
   const cat = state.catalog || [];
   const rank = { LARGE: 0, MEDIUM: 1, SMALL: 2 };
   const sorted = cat
@@ -2097,6 +2144,7 @@ async function handleLaunch() {
       buildTrajectoryCurve(state.scene, trajPoints);
       createRocketMesh(state.scene);
       positionRocketAtProgress(0);
+      showWindowRisks(state.scene, w);
 
       // Show markers
       const moonPosThree = eciToThreeJs(w.moonArrivalPosition);

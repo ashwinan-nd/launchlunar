@@ -1144,6 +1144,65 @@ export class LunarScene {
     this.scene.add(this._trajectoryGroup);
   }
 
+  /**
+   * Draw red pulsing warning markers at conjunction points along the trajectory.
+   * @param {Array<{pos:{x,y,z}, label:string, critical:boolean}>} markers
+   */
+  showConjunctionMarkers(markers) {
+    this.clearConjunctionMarkers();
+    if (!markers || markers.length === 0) return;
+    const group = new THREE.Group();
+    group.name = 'conjunctionMarkers';
+    for (const m of markers) {
+      const color = m.critical ? 0xff2222 : 0xffaa00;
+      const geo = new THREE.SphereGeometry(0.02, 12, 12);
+      const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 });
+      const dot = new THREE.Mesh(geo, mat);
+      dot.position.set(m.pos.x, m.pos.y, m.pos.z);
+      dot.userData._isPulse = true;
+      group.add(dot);
+      this._disposables.push(geo, mat);
+      // ring
+      const rgeo = new THREE.RingGeometry(0.03, 0.045, 20);
+      const rmat = new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, transparent: true, opacity: 0.6 });
+      const ring = new THREE.Mesh(rgeo, rmat);
+      ring.position.copy(dot.position);
+      ring.lookAt(this.camera.position);
+      ring.userData._isPulse = true;
+      group.add(ring);
+      this._disposables.push(rgeo, rmat);
+      if (m.label) {
+        const cv = document.createElement('canvas');
+        cv.width = 256; cv.height = 40;
+        const x = cv.getContext('2d');
+        x.fillStyle = m.critical ? '#ff5555' : '#ffcc44';
+        x.font = 'bold 22px sans-serif';
+        x.textBaseline = 'middle';
+        x.fillText(m.label, 6, 20);
+        const tex = new THREE.CanvasTexture(cv);
+        const smat = new THREE.SpriteMaterial({ map: tex, transparent: true });
+        const sprite = new THREE.Sprite(smat);
+        sprite.position.set(m.pos.x, m.pos.y + 0.06, m.pos.z);
+        sprite.scale.set(0.5, 0.08, 1);
+        group.add(sprite);
+        this._disposables.push(tex, smat);
+      }
+    }
+    this._conjunctionMarkers = group;
+    this.scene.add(group);
+  }
+
+  clearConjunctionMarkers() {
+    if (this._conjunctionMarkers) {
+      this.scene.remove(this._conjunctionMarkers);
+      this._conjunctionMarkers.traverse((c) => {
+        if (c.geometry) c.geometry.dispose();
+        if (c.material) c.material.dispose();
+      });
+      this._conjunctionMarkers = null;
+    }
+  }
+
   clearTrajectory() {
     if (this._trajectoryGroup) {
       this.scene.remove(this._trajectoryGroup);
