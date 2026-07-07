@@ -1030,6 +1030,61 @@ export class LunarScene {
   }
 
   /**
+   * Raycast the orbital object clouds and return the picked object's identity.
+   * @param {number} ndcX  normalized device X (-1..1)
+   * @param {number} ndcY  normalized device Y (-1..1)
+   * @returns {{gidx:number, category:string, index:number, point:THREE.Vector3}|null}
+   */
+  pickObject(ndcX, ndcY) {
+    if (!this._raycaster) this._raycaster = new THREE.Raycaster();
+    this._raycaster.params.Points.threshold = 0.025;
+    this._raycaster.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
+    let best = null;
+    for (const [cat, pts] of this._orbitalMeshes) {
+      if (!pts.visible) continue;
+      const hits = this._raycaster.intersectObject(pts);
+      for (const h of hits) {
+        if (!best || h.distanceToRay < best.distanceToRay) {
+          best = { category: cat, index: h.index, distanceToRay: h.distanceToRay, point: h.point };
+        }
+      }
+    }
+    if (!best) return null;
+    const gidxArr = this._orbitalCategoryGidx.get(best.category);
+    const gidx = gidxArr ? gidxArr[best.index] : -1;
+    return { gidx, category: best.category, index: best.index, point: best.point };
+  }
+
+  /** Current world position of a category's local-index point, or null. */
+  getObjectWorldPosition(category, index) {
+    const pts = this._orbitalMeshes.get(category);
+    if (!pts) return null;
+    const a = pts.geometry.getAttribute('position');
+    if (!a || index < 0 || index >= a.count) return null;
+    return new THREE.Vector3(a.array[index * 3], a.array[index * 3 + 1], a.array[index * 3 + 2]);
+  }
+
+  /** Show a selection highlight ring at a world position. */
+  showSelectionMarker(pos) {
+    this.clearSelectionMarker();
+    const geo = new THREE.RingGeometry(0.03, 0.045, 24);
+    const mat = new THREE.MeshBasicMaterial({ color: 0x00e0ff, side: THREE.DoubleSide, transparent: true, opacity: 0.9 });
+    const ring = new THREE.Mesh(geo, mat);
+    ring.position.copy(pos);
+    ring.userData._isSelMarker = true;
+    this._selectionMarker = ring;
+    this.scene.add(ring);
+    this._disposables.push(geo, mat);
+  }
+
+  clearSelectionMarker() {
+    if (this._selectionMarker) {
+      this.scene.remove(this._selectionMarker);
+      this._selectionMarker = null;
+    }
+  }
+
+  /**
    * Toggle visibility of an orbital category.
    * @param {string} category
    * @param {boolean} visible
@@ -1868,6 +1923,13 @@ export class LunarScene {
       }
       this._updateRocketPosition(anim.t);
       if (anim.onProgress) anim.onProgress(anim.t);
+    }
+
+    // Keep the selection marker facing the camera and gently pulsing.
+    if (this._selectionMarker) {
+      this._selectionMarker.lookAt(this.camera.position);
+      const s = 1 + Math.sin(elapsed * 5) * 0.25;
+      this._selectionMarker.scale.set(s, s, s);
     }
 
     // Camera follow: keep the orbit target on the rocket / Moon core so the user

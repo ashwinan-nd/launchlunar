@@ -825,6 +825,24 @@ function injectStyles() {
       background: rgba(59,130,246,0.2);
       border-color: rgba(59,130,246,0.5);
     }
+
+    /* ===== OBJECT INFO PANEL (click / search to inspect) ===== */
+    .object-info {
+      position: absolute;
+      left: 336px;
+      bottom: 16px;
+      width: 268px;
+      padding: 12px 14px;
+      z-index: 17;
+      display: none;
+      border-radius: 8px;
+      background: rgba(0,0,0,0.82);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(0,224,255,0.25);
+      box-shadow: 0 0 24px rgba(0,224,255,0.08);
+    }
+    .left-sidebar.collapsed ~ .object-info { left: 64px; }
   `;
   document.head.appendChild(style);
 }
@@ -1363,6 +1381,70 @@ function selectWindow(idx, windows, formValues) {
 // ---------------------------------------------------------------------------
 // Three.js helpers (trajectory curve, tick marks, rocket)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Object info panel (click / search to inspect a real tracked object)
+// ---------------------------------------------------------------------------
+
+function computeObjectInfo(o) {
+  try {
+    const sat = satellite.twoline2satrec(o.l1, o.l2);
+    if (!sat || sat.error) return null;
+    const pv = satellite.propagate(sat, new Date());
+    if (!pv || !pv.position) return null;
+    const r = Math.hypot(pv.position.x, pv.position.y, pv.position.z);
+    const speed = pv.velocity ? Math.hypot(pv.velocity.x, pv.velocity.y, pv.velocity.z) : 0;
+    return {
+      altKm: r - 6371,
+      speedKms: speed,
+      incDeg: sat.inclo * 180 / Math.PI,
+      periodMin: sat.no > 0 ? (2 * Math.PI) / sat.no : 0,
+    };
+  } catch (e) { return null; }
+}
+
+function showObjectInfoByGidx(gidx, category, index) {
+  const o = state.catalog && state.catalog[gidx];
+  if (!o) return;
+  const info = computeObjectInfo(o);
+  const panel = document.getElementById('object-info');
+  if (!panel) return;
+  const catColor = (CATEGORY_DISPLAY.find((c) => c.key === o.cat) || {}).color || '#8899aa';
+  panel.innerHTML = '';
+  panel.appendChild(el('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' } },
+    el('span', { style: { fontWeight: '700', fontSize: '0.82rem', color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '230px' } }, o.name),
+    el('span', { style: { cursor: 'pointer', color: '#889', fontSize: '1rem', paddingLeft: '8px' }, onclick: hideObjectInfo }, '×'),
+  ));
+  const row = (label, val) => el('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', padding: '2px 0' } },
+    el('span', { style: { color: '#667' } }, label),
+    el('span', { style: { color: '#cdd', fontVariantNumeric: 'tabular-nums' } }, val));
+  panel.appendChild(row('NORAD ID', String(o.id)));
+  panel.appendChild(row('Int’l Desig', o.intl || '—'));
+  panel.appendChild(el('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', padding: '2px 0' } },
+    el('span', { style: { color: '#667' } }, 'Category'),
+    el('span', { style: { color: catColor, fontWeight: '600' } }, getCategoryLabel(o.cat)),
+  ));
+  if (o.rcs) panel.appendChild(row('RCS Size', o.rcs));
+  if (o.cc) panel.appendChild(row('Country', o.cc));
+  if (info) {
+    panel.appendChild(row('Altitude', `${info.altKm.toFixed(0)} km`));
+    panel.appendChild(row('Velocity', `${info.speedKms.toFixed(2)} km/s`));
+    panel.appendChild(row('Inclination', `${info.incDeg.toFixed(2)}°`));
+    panel.appendChild(row('Period', `${info.periodMin.toFixed(1)} min`));
+  }
+  panel.style.display = 'block';
+
+  if (state.scene && index != null && index >= 0) {
+    const p = state.scene.getObjectWorldPosition(category, index);
+    if (p) state.scene.showSelectionMarker(p);
+  }
+}
+
+function hideObjectInfo() {
+  const panel = document.getElementById('object-info');
+  if (panel) panel.style.display = 'none';
+  if (state.scene) state.scene.clearSelectionMarker();
+}
 
 // Highlight a window's screened conjunction objects: red markers on the trajectory +
 // a listed high-risk panel in the right sidebar.
@@ -2236,6 +2318,9 @@ function init() {
   // Info panel (bottom-right)
   app.appendChild(buildInfoPanel());
 
+  // Object info panel (click / search to inspect a tracked object)
+  app.appendChild(el('div', { className: 'object-info', id: 'object-info' }));
+
   // ---- Wire up events ----
 
   // Sidebar collapse/expand
@@ -2267,15 +2352,29 @@ function init() {
   // Search input — filters category toggle pills by label text
   const searchInput = document.getElementById('top-bar-search');
   if (searchInput) {
-    searchInput.addEventListener('input', () => {
-      const query = searchInput.value.trim().toLowerCase();
-      const toggles = document.querySelectorAll('.sat-toggle');
-      for (const toggle of toggles) {
-        if (!query) {
-          toggle.style.display = '';
-        } else {
-          const text = toggle.textContent.toLowerCase();
-          toggle.style.display = text.includes(query) ? '' : 'none';
+    searchInput.setAttribute('placeholder', 'Search name / NORAD…');
+    // Enter: find a real object by name or NORAD id and inspect it.
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      const q = searchInput.value.trim().toLowerCase();
+      if (!q || !state.catalog) return;
+      let gidx = -1;
+      for (let i = 0; i < state.catalog.length; i++) {
+        const o = state.catalog[i];
+        if (String(o.id) === q || (o.name && o.name.toLowerCase().includes(q))) { gidx = i; break; }
+      }
+      if (gidx < 0) return;
+      const o = state.catalog[gidx];
+      const arr = state.scene && state.scene._orbitalCategoryGidx.get(o.cat);
+      const idx = arr ? arr.indexOf(gidx) : -1;
+      showObjectInfoByGidx(gidx, o.cat, idx);
+      // Focus the camera on the found object.
+      if (state.scene && idx >= 0) {
+        const p = state.scene.getObjectWorldPosition(o.cat, idx);
+        if (p) {
+          const off = p.clone().normalize().multiplyScalar(0.6);
+          state.scene._followRocket = false; state.scene._followMoon = false;
+          state.scene._animateCameraTo(p.clone().add(off), p.clone(), 1.2);
         }
       }
     });
@@ -2284,6 +2383,22 @@ function init() {
   // ---- Create 3D scene immediately ----
   try {
     state.scene = new LunarScene(canvasContainer);
+
+    // Click-to-inspect: raycast the object clouds (ignoring camera drags).
+    const canvasEl = state.scene.renderer.domElement;
+    let downXY = null;
+    canvasEl.addEventListener('pointerdown', (e) => { downXY = [e.clientX, e.clientY]; });
+    canvasEl.addEventListener('pointerup', (e) => {
+      if (!downXY) return;
+      const moved = Math.hypot(e.clientX - downXY[0], e.clientY - downXY[1]);
+      downXY = null;
+      if (moved > 5) return; // treat as an orbit drag, not a pick
+      const rect = canvasEl.getBoundingClientRect();
+      const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      const hit = state.scene.pickObject(ndcX, ndcY);
+      if (hit && hit.gidx >= 0) showObjectInfoByGidx(hit.gidx, hit.category, hit.index);
+    });
 
     // Orbital object positions come from the propagation worker (see loadInitialOrbitalData).
     state.scene.animate();
