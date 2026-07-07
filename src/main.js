@@ -1339,8 +1339,9 @@ function selectWindow(idx, windows, formValues) {
     z: earthSurfacePos.z,
   });
 
-  // Create rocket mesh
+  // Create rocket mesh and place it at the launch point (visible on the pad).
   createRocketMesh(scene);
+  positionRocketAtProgress(0);
 
   // Reset play state
   state.playProgress = 0;
@@ -1432,69 +1433,15 @@ function addTrajectoryTickMarks(scene, windowData) {
 }
 
 function createRocketMesh(scene) {
-  if (state.rocketMesh) {
-    scene.scene.remove(state.rocketMesh);
-    state.rocketMesh = null;
-  }
-  if (state.rocketExhaust) {
-    scene.scene.remove(state.rocketExhaust);
-    state.rocketExhaust = null;
-  }
-
-  import('three').then((THREE) => {
-    if (state.rocketMesh) {
-      scene.scene.remove(state.rocketMesh);
-    }
-
-    const group = new THREE.Group();
-    group.name = 'rocketShip';
-
-    const bodyGeo = new THREE.CylinderGeometry(0.012, 0.015, 0.08, 8);
-    const bodyMat = new THREE.MeshStandardMaterial({
-      color: 0xdddddd, roughness: 0.4, metalness: 0.6,
-      emissive: 0x444444, emissiveIntensity: 0.3,
-    });
-    group.add(new THREE.Mesh(bodyGeo, bodyMat));
-
-    const noseGeo = new THREE.ConeGeometry(0.012, 0.03, 8);
-    const noseMat = new THREE.MeshStandardMaterial({
-      color: 0xff4444, roughness: 0.3, metalness: 0.5,
-      emissive: 0xff2222, emissiveIntensity: 0.4,
-    });
-    const nose = new THREE.Mesh(noseGeo, noseMat);
-    nose.position.y = 0.055;
-    group.add(nose);
-
-    const engineGeo = new THREE.CylinderGeometry(0.018, 0.01, 0.02, 8);
-    const engineMat = new THREE.MeshStandardMaterial({
-      color: 0x888888, roughness: 0.5, metalness: 0.7,
-    });
-    const engine = new THREE.Mesh(engineGeo, engineMat);
-    engine.position.y = -0.05;
-    group.add(engine);
-
-    const exhaustGeo = new THREE.ConeGeometry(0.015, 0.06, 8);
-    const exhaustMat = new THREE.MeshBasicMaterial({
-      color: 0x1a73e8, transparent: true, opacity: 0.7,
-    });
-    const exhaust = new THREE.Mesh(exhaustGeo, exhaustMat);
-    exhaust.position.y = -0.08;
-    exhaust.rotation.x = Math.PI;
-    exhaust.visible = false;
-    group.add(exhaust);
-
-    const rocketLight = new THREE.PointLight(0x1a73e8, 0.5, 0.5);
-    rocketLight.position.y = -0.06;
-    group.add(rocketLight);
-
-    group.visible = false;
-    scene.scene.add(group);
-
-    state.rocketMesh = group;
-    state.rocketExhaust = exhaust;
-
-    scene._disposables.push(bodyGeo, bodyMat, noseGeo, noseMat, engineGeo, engineMat, exhaustGeo, exhaustMat);
-  });
+  // Use the scene's detailed rocket model (staged body, engine nozzle, fins, animated
+  // exhaust plume). createRocket() is idempotent (disposes any previous rocket).
+  const height = (state.formValues && state.formValues.height) || 70;
+  const rocket = scene.createRocket(height, Math.max(2, height * 0.06));
+  // Scale up for visibility against Earth (radius = 1 unit); the physical size is tiny.
+  rocket.scale.multiplyScalar(4);
+  rocket.visible = false;
+  state.rocketMesh = rocket;
+  state.rocketExhaust = scene._rocketExhaust || null;
 }
 
 function positionRocketAtProgress(progress) {
@@ -2149,6 +2096,7 @@ async function handleLaunch() {
       addTrajectoryTickMarks(state.scene, w);
       buildTrajectoryCurve(state.scene, trajPoints);
       createRocketMesh(state.scene);
+      positionRocketAtProgress(0);
 
       // Show markers
       const moonPosThree = eciToThreeJs(w.moonArrivalPosition);

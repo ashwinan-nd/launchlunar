@@ -63,6 +63,98 @@ function getPointSize(category) {
   return CATEGORY_POINT_SIZES[key] ?? 3;
 }
 
+// RCS size class -> relative scale multiplier (real objects sized by radar cross-section).
+const RCS_SCALE = { LARGE: 2.2, MEDIUM: 1.45, SMALL: 0.95 };
+function rcsScale(rcs) { return RCS_SCALE[rcs] ?? 0.85; }
+
+// ---------------------------------------------------------------------------
+// Per-category glyph textures — objects "look like what they are"
+// ---------------------------------------------------------------------------
+const _glyphCache = new Map();
+function glyphShapeFor(category) {
+  const c = category.toLowerCase();
+  if (c === 'debris') return 'debris';
+  if (c === 'rocket body' || c === 'rocket_body') return 'rocket';
+  if (c === 'iss' || c === 'station') return 'station';
+  if (c === 'gps' || c === 'glonass' || c === 'galileo' || c === 'beidou') return 'nav';
+  if (c === 'weather') return 'disc';
+  return 'satellite'; // satellite/starlink/oneweb/iridium: body + panels
+}
+
+function getGlyphTexture(shape) {
+  if (_glyphCache.has(shape)) return _glyphCache.get(shape);
+  const S = 64;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const x = cv.getContext('2d');
+  x.clearRect(0, 0, S, S);
+  x.fillStyle = '#ffffff';
+  x.strokeStyle = '#ffffff';
+  const cx = S / 2, cy = S / 2;
+  if (shape === 'satellite') {
+    // central body + two solar panels
+    x.fillRect(cx - 6, cy - 6, 12, 12);
+    x.fillRect(cx - 26, cy - 4, 16, 8);
+    x.fillRect(cx + 10, cy - 4, 16, 8);
+  } else if (shape === 'rocket') {
+    // elongated capsule
+    x.beginPath();
+    x.roundRect ? x.roundRect(cx - 6, cy - 22, 12, 44, 6) : x.rect(cx - 6, cy - 22, 12, 44);
+    x.fill();
+  } else if (shape === 'station') {
+    // large H / truss
+    x.fillRect(cx - 4, cy - 22, 8, 44);
+    x.fillRect(cx - 24, cy - 6, 48, 12);
+  } else if (shape === 'nav') {
+    // diamond
+    x.beginPath();
+    x.moveTo(cx, cy - 22); x.lineTo(cx + 22, cy); x.lineTo(cx, cy + 22); x.lineTo(cx - 22, cy);
+    x.closePath(); x.fill();
+  } else if (shape === 'disc') {
+    x.beginPath(); x.arc(cx, cy, 20, 0, TWO_PI); x.fill();
+  } else if (shape === 'debris') {
+    // irregular jagged speck
+    x.beginPath();
+    const pts = [[0,-18],[10,-6],[20,2],[6,8],[10,20],[-4,12],[-18,16],[-12,0],[-20,-8],[-6,-10]];
+    pts.forEach((p, i) => { const px = cx + p[0], py = cy + p[1]; i ? x.lineTo(px, py) : x.moveTo(px, py); });
+    x.closePath(); x.fill();
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.needsUpdate = true;
+  _glyphCache.set(shape, tex);
+  return tex;
+}
+
+function makeGlyphMaterial(colorHex, glyphTex) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: new THREE.Color(colorHex) },
+      uTex: { value: glyphTex },
+      uPixel: { value: Math.min(window.devicePixelRatio, 2) },
+    },
+    vertexShader: /* glsl */ `
+      attribute float aSize;
+      uniform float uPixel;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = aSize * uPixel;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uColor;
+      uniform sampler2D uTex;
+      void main() {
+        vec4 t = texture2D(uTex, gl_PointCoord);
+        if (t.a < 0.35) discard;
+        gl_FragColor = vec4(uColor, t.a);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Texture Loader with multi-URL fallback
 // ---------------------------------------------------------------------------
@@ -308,6 +400,7 @@ export class LunarScene {
     // Camera animation state (gsap-based)
     this._cameraAnim = null;
     this._followRocket = false;
+    this._followMoon = false;
 
     // ---- Renderer ----
     this.renderer = new THREE.WebGLRenderer({
@@ -387,7 +480,8 @@ export class LunarScene {
     this._createStarfield(starTex);
     this._createEarth(dayTex, nightTex, cloudTex, bumpTex);
     this._createMoon(moonTex);
-    this._addDebrisCloud();
+    // (Synthetic debris cloud removed — the real Space-Track catalog now includes
+    // ~10k tracked debris objects rendered with real SGP4 positions.)
 
     this._texturesLoaded = true;
   }
@@ -781,29 +875,27 @@ export class LunarScene {
 
     for (const [category, items] of groups) {
       const positions = new Float32Array(items.length * 3);
+      const sizes = new Float32Array(items.length);
       const gidx = new Int32Array(items.length);
+      const baseSize = getPointSize(category);
       for (let i = 0; i < items.length; i++) {
         positions[i * 3] = items[i].position.x;
         positions[i * 3 + 1] = items[i].position.y;
         positions[i * 3 + 2] = items[i].position.z;
+        // Screen-space size scaled by RCS class; clamped so glyph shapes read clearly
+        // without large objects (ISS/stations) ballooning.
+        sizes[i] = Math.max(3.5, Math.min(20, baseSize * 2.2 * rcsScale(items[i].rcs)));
         gidx[i] = items[i].idx != null ? items[i].idx : -1;
       }
       this._orbitalCategoryGidx.set(category, gidx);
 
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
 
       const color = getCategoryColorHex(category);
-      const pointSize = getPointSize(category);
-
-      const material = new THREE.PointsMaterial({
-        color,
-        size: pointSize,
-        sizeAttenuation: false, // Fixed screen-space size
-        transparent: true,
-        opacity: 0.9,
-        depthWrite: false,
-      });
+      const glyphTex = getGlyphTexture(glyphShapeFor(category));
+      const material = makeGlyphMaterial(color, glyphTex);
 
       const points = new THREE.Points(geometry, material);
       points.frustumCulled = false;
@@ -1457,6 +1549,7 @@ export class LunarScene {
 
   focusEarth() {
     this._followRocket = false;
+    this._followMoon = false;
     this._animateCameraTo(
       new THREE.Vector3(0, 1.5, 3),
       new THREE.Vector3(0, 0, 0),
@@ -1465,7 +1558,9 @@ export class LunarScene {
   }
 
   focusMoon() {
+    // Orbit around the Moon core; the per-frame follow keeps the target on the moving Moon.
     this._followRocket = false;
+    this._followMoon = true;
     const moonPos = this.moon ? this.moon.position.clone() : new THREE.Vector3(MOON_DISTANCE, 0, 0);
     const offset = new THREE.Vector3(0, 0.3, 1.5);
     this._animateCameraTo(
@@ -1476,16 +1571,21 @@ export class LunarScene {
   }
 
   focusTrajectory() {
-    this._followRocket = false;
-    const moonPos = this.moon ? this.moon.position.clone() : new THREE.Vector3(MOON_DISTANCE, 0, 0);
-    const mid = moonPos.clone().multiplyScalar(0.45);
-    const totalDist = moonPos.length();
-    const camPos = new THREE.Vector3(
-      mid.x,
-      totalDist * 0.8,
-      mid.z + totalDist * 0.3,
-    );
-    this._animateCameraTo(camPos, mid, 2.0);
+    // Orbit around the rocket; the per-frame follow keeps the target on it as it flies.
+    this._followMoon = false;
+    if (this._rocket) {
+      this._followRocket = true;
+      const rp = this._rocket.position.clone();
+      const offset = new THREE.Vector3(0.6, 0.4, 0.6);
+      this._animateCameraTo(rp.clone().add(offset), rp, 1.5);
+    } else {
+      this._followRocket = false;
+      const moonPos = this.moon ? this.moon.position.clone() : new THREE.Vector3(MOON_DISTANCE, 0, 0);
+      const mid = moonPos.clone().multiplyScalar(0.45);
+      const totalDist = moonPos.length();
+      const camPos = new THREE.Vector3(mid.x, totalDist * 0.8, mid.z + totalDist * 0.3);
+      this._animateCameraTo(camPos, mid, 2.0);
+    }
   }
 
   followRocket() {
@@ -1711,12 +1811,12 @@ export class LunarScene {
       if (anim.onProgress) anim.onProgress(anim.t);
     }
 
-    // Follow rocket camera
+    // Camera follow: keep the orbit target on the rocket / Moon core so the user
+    // orbits around it (Earth view targets the origin, handled by focusEarth).
     if (this._followRocket && this._rocket && this._rocket.visible) {
-      const rocketPos = this._rocket.position.clone();
-      const offset = new THREE.Vector3(0.1, 0.05, 0.15);
-      this.camera.position.lerp(rocketPos.clone().add(offset), 0.05);
-      this.controls.target.lerp(rocketPos, 0.05);
+      this.controls.target.lerp(this._rocket.position, 0.12);
+    } else if (this._followMoon && this.moon) {
+      this.controls.target.lerp(this.moon.position, 0.12);
     }
 
     // Render
