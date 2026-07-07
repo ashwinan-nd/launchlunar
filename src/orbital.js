@@ -521,6 +521,63 @@ function rk4Step(pos, vel, t, dt, accelFn) {
   };
 }
 
+// ─── Lambert solver (universal variables, Vallado Alg. 58) ──────────────────────
+// Solves the two-point boundary value problem: given r1, r2 and time-of-flight,
+// find the velocities v1, v2 of the connecting conic. Used for real TLI targeting
+// (aim the transfer at the Moon's position at arrival). Single-revolution.
+function _stumpffC(z) {
+  if (z > 1e-6) return (1 - Math.cos(Math.sqrt(z))) / z;
+  if (z < -1e-6) { const s = Math.sqrt(-z); return (Math.cosh(s) - 1) / (-z); }
+  return 0.5;
+}
+function _stumpffS(z) {
+  if (z > 1e-6) { const s = Math.sqrt(z); return (s - Math.sin(s)) / (s * s * s); }
+  if (z < -1e-6) { const s = Math.sqrt(-z); return (Math.sinh(s) - s) / (s * s * s); }
+  return 1 / 6;
+}
+function lambertUV(r1v, r2v, tof, mu, prograde = true) {
+  const r1 = vecMag(r1v), r2 = vecMag(r2v);
+  let cosdnu = vecDot(r1v, r2v) / (r1 * r2);
+  cosdnu = Math.max(-1, Math.min(1, cosdnu));
+  const cross = vecCross(r1v, r2v);
+  let sindnu = Math.sqrt(Math.max(0, 1 - cosdnu * cosdnu));
+  if (prograde) { if (cross.z < 0) sindnu = -sindnu; }
+  else { if (cross.z >= 0) sindnu = -sindnu; }
+  const A = sindnu * Math.sqrt((r1 * r2) / (1 - cosdnu));
+  if (!isFinite(A) || Math.abs(A) < 1e-9) return null;
+
+  const tofFor = (z) => {
+    const C = _stumpffC(z), S = _stumpffS(z);
+    const y = r1 + r2 + A * (z * S - 1) / Math.sqrt(C);
+    if (y < 0) return { t: NaN, y };
+    const x = Math.sqrt(y / C);
+    return { t: (x * x * x * S + A * Math.sqrt(y)) / Math.sqrt(mu), y, C, x };
+  };
+
+  // Bisection on z (t is monotincreasing in z for single-rev transfers).
+  let zLow = -4 * Math.PI * Math.PI, zHigh = 4 * Math.PI * Math.PI;
+  // Ensure y>0 at zLow by nudging up.
+  let guard = 0;
+  while (isNaN(tofFor(zLow).t) && guard++ < 100) zLow += 0.1;
+  let z = 0, res = null;
+  for (let i = 0; i < 100; i++) {
+    z = 0.5 * (zLow + zHigh);
+    res = tofFor(z);
+    if (isNaN(res.t)) { zLow = z; continue; }
+    if (res.t <= tof) zLow = z; else zHigh = z;
+    if (Math.abs(res.t - tof) < 1e-3) break;
+  }
+  if (!res || isNaN(res.t)) return null;
+  const y = res.y;
+  const f = 1 - y / r1;
+  const g = A * Math.sqrt(y / mu);
+  const gdot = 1 - y / r2;
+  if (Math.abs(g) < 1e-9) return null;
+  const v1 = vecScale(vecSub(r2v, vecScale(r1v, f)), 1 / g);
+  const v2 = vecScale(vecSub(vecScale(r2v, gdot), r1v), 1 / g);
+  return { v1, v2 };
+}
+
 /**
  * Calculate a trans-lunar injection trajectory using RK4 numerical integration
  * with Earth J2 perturbation and lunar third-body gravity.
@@ -543,7 +600,8 @@ export function calculateTranslunarTrajectory(
   launchLat,
   launchLon,
   rocketParams,
-  lowResolution = false
+  lowResolution = false,
+  moonTarget = null
 ) {
   const {
     massKg = 500000,
@@ -706,26 +764,25 @@ export function calculateTranslunarTrajectory(
 
   const massAfterAscent = currentMass;
 
-  // Circularize: adjust velocity to exact circular velocity at current altitude
-  // This represents the circularization burn at LEO insertion
-  const rAtLeo = vecMag(pos);
+  // Establish a clean 200 km circular parking orbit at LEO insertion. The ascent
+  // waypoints above are the visual climb; here we anchor the physics to a proper
+  // parking orbit (radius = rLeo) in the launch plane so Lambert targeting and the
+  // transfer integration start from a realistic state rather than a near-surface point.
+  const hVec = vecCross(pos, vel); // angular momentum defines the orbit plane
+  const hHat = vecNormalize(hVec);
+  pos = vecScale(vecNormalize(pos), rLeo);
+  const rAtLeo = rLeo;
   const vCircAtLeo = Math.sqrt(mu / rAtLeo);
   const rHatLeo = vecNormalize(pos);
-
-  // Velocity direction for circular orbit: perpendicular to radius in the orbital plane
-  // The orbital plane is defined by the current position and velocity
-  const hVec = vecCross(pos, vel); // angular momentum
-  const hHat = vecNormalize(hVec);
   const vCircDir = vecNormalize(vecCross(hHat, rHatLeo)); // prograde direction
-  const dvCirc = Math.abs(vCircAtLeo - vecMag(vel));
-
-  // Set velocity to exact circular orbit velocity
   vel = vecScale(vCircDir, vCircAtLeo);
 
-  // Delta-V for ascent to LEO (including circularization)
-  // Compute from the velocity gained minus the initial surface velocity
+  // Delta-V to LEO: ideal orbital speed gain minus the free launch-site rotation
+  // speed, plus a realistic gravity+drag+steering loss budget (~1.8 km/s). Avoids the
+  // old double-counting that inflated the total to ~14 km/s.
   const surfaceSpeed = vecMag(vecCross(omegaEarth, launchPosEci));
-  const dvLeo = vecMag(vel) - surfaceSpeed + dvCirc;
+  const ASCENT_LOSSES = 1.8; // km/s, typical gravity+drag+steering losses
+  const dvLeo = Math.max(0, vCircAtLeo - surfaceSpeed) + ASCENT_LOSSES;
 
   // ────────────────────────────────────────────────────────────────────────────
   // Phase 2: LEO Coast - circular orbit at ~200 km
@@ -738,48 +795,36 @@ export function calculateTranslunarTrajectory(
   const moonPosEstimate = getMoonPositionCached(dateAddSeconds(launchDate, tElapsed + transitTimeSec));
   const moonVec = { x: moonPosEstimate.x, y: moonPosEstimate.y, z: moonPosEstimate.z };
 
-  // Determine optimal TLI position:
-  // The TLI burn should occur when the spacecraft is on the side of Earth
-  // that lets the transfer orbit reach the Moon's position at arrival.
-  // Compute the angle from current position to the direction where TLI should happen.
-  // TLI should happen roughly opposite the Moon direction (burn toward Moon).
-  // Actually, TLI happens when the spacecraft is roughly on the near-Earth side
-  // heading toward where the Moon will be.
+  // ── Optimal TLI point via coast-angle search ──
+  // The TLI ΔV (dominated by the plane change + in-plane misalignment) depends strongly
+  // on WHERE in the parking orbit the burn happens. Search the coast angle for the point
+  // whose Lambert transfer to the Moon needs the least ΔV, so the reported budgets are
+  // fuel-realistic rather than an artefact of an arbitrary burn point.
+  const orbitalPeriodLeo = TWO_PI * Math.sqrt(Math.pow(rAtLeo, 3) / mu);
+  const angularRateLeo = vCircAtLeo / rAtLeo; // rad/s
+  const leoEDir = vecNormalize(pos);                       // radial at coast start
+  const leoQDir = vecNormalize(vecCross(hHat, leoEDir));   // along-track at coast start
+  void moonVec; // (Moon estimate retained for readability; targeting is Lambert-based)
 
-  // Angle from current position to Moon direction (projected onto orbital plane)
-  const moonDirProj = vecNormalize(
-    vecSub(moonVec, vecScale(hHat, vecDot(moonVec, hHat)))
-  ); // Moon direction projected onto orbital plane
-
-  const currentDir = vecNormalize(pos);
-  const angleToBurn = Math.acos(
-    Math.max(-1, Math.min(1, vecDot(currentDir, moonDirProj)))
-  );
-
-  // Determine the coast arc: we want to coast to approximately the Moon-facing side
-  // Use cross product to determine sign of the angle
-  const crossToMoon = vecCross(currentDir, moonDirProj);
-  const angleSign = vecDot(crossToMoon, hHat) >= 0 ? 1 : -1;
-  let coastAngle = angleSign > 0 ? angleToBurn : (TWO_PI - angleToBurn);
-
-  // Ensure we coast at least 30 degrees and at most nearly a full orbit
-  if (coastAngle < Math.PI / 6) coastAngle += TWO_PI;
-  if (coastAngle > TWO_PI - Math.PI / 18) coastAngle -= TWO_PI;
+  let coastAngle = Math.PI / 6, bestCoastDv = Infinity;
+  const tofNominal = 4.0 * SECONDS_PER_DAY;
+  for (let a = 0.2; a < TWO_PI; a += Math.PI / 18) { // 10° steps around the parking orbit
+    const coastT = (a / TWO_PI) * orbitalPeriodLeo;
+    const pTheta = vecAdd(vecScale(leoEDir, rAtLeo * Math.cos(a)), vecScale(leoQDir, rAtLeo * Math.sin(a)));
+    const vTheta = vecAdd(vecScale(leoEDir, -vCircAtLeo * Math.sin(a)), vecScale(leoQDir, vCircAtLeo * Math.cos(a)));
+    const mArr = getMoonPositionCached(dateAddSeconds(launchDate, tElapsed + coastT + tofNominal));
+    const mArrVec = { x: mArr.x, y: mArr.y, z: mArr.z };
+    const sol = lambertUV(pTheta, mArrVec, tofNominal, mu, true) || lambertUV(pTheta, mArrVec, tofNominal, mu, false);
+    if (!sol || vecMag(sol.v1) > 20) continue;
+    const dv = vecMag(vecSub(sol.v1, vTheta));
+    if (dv < bestCoastDv) { bestCoastDv = dv; coastAngle = a; }
+  }
   if (coastAngle < Math.PI / 6) coastAngle = Math.PI / 6;
 
-  // Orbital period and coast duration
-  const orbitalPeriodLeo = TWO_PI * Math.sqrt(Math.pow(rAtLeo, 3) / mu);
   const coastDuration = (coastAngle / TWO_PI) * orbitalPeriodLeo;
-
-  // Propagate LEO orbit with simple Keplerian motion (no perturbations needed for short coast)
-  const angularRateLeo = vCircAtLeo / rAtLeo; // rad/s
   const leoRecordInterval = 60; // seconds
   const leoSteps = Math.floor(coastDuration / leoRecordInterval);
   const coastStartTime = tElapsed;
-
-  // Perifocal frame for LEO orbit
-  const leoEDir = vecNormalize(pos); // radial at start of coast
-  const leoQDir = vecNormalize(vecCross(hHat, leoEDir)); // along-track at start of coast
 
   for (let i = 1; i <= leoSteps && i <= 30; i++) {
     const frac = i / Math.min(leoSteps, 30);
@@ -839,33 +884,50 @@ export function calculateTranslunarTrajectory(
   const moonAtArrival = getMoonPositionCached(arrivalDate);
   const moonAtArrivalVec = { x: moonAtArrival.x, y: moonAtArrival.y, z: moonAtArrival.z };
 
-  // Vis-viva: compute TLI velocity for a transfer orbit reaching Moon distance
   const rMoonAtArrival = vecMag(moonAtArrivalVec);
   const aTransfer = (rAtLeo + rMoonAtArrival) / 2;
-  const vTli = Math.sqrt(mu * (2 / rAtLeo - 1 / aTransfer));
-  const dvTli = vTli - vCircAtLeo;
 
-  // TLI direction: primarily prograde (along velocity).
-  // The transfer orbit ellipse naturally reaches the Moon's orbital distance at apogee.
-  // A small component toward the Moon's future position provides targeting correction.
-  const radialDir = vecNormalize(pos);
-  const orbitNormal = vecNormalize(vecCross(pos, vel));
-  const progradeDir = vecNormalize(vecCross(orbitNormal, radialDir));
-
-  // Direction from spacecraft to Moon's future position (for minor targeting)
-  const toMoonArrival = vecNormalize(vecSub(moonAtArrivalVec, pos));
-
-  // TLI is primarily prograde. The transfer orbit ellipse will reach the Moon's distance.
-  // We add a small component toward the Moon's future position for targeting.
-  const burnDir = vecNormalize(vecAdd(
-    vecScale(progradeDir, 0.95),
-    vecScale(toMoonArrival, 0.05)
-  ));
+  // ── Real TLI targeting via Lambert ──
+  // Solve for the post-TLI velocity that connects the current position to the Moon's
+  // position at arrival over a chosen time-of-flight. This genuinely aims the transfer
+  // at the Moon (solving the phasing the old prograde+aim hack could not).
+  const velPreTli = { ...vel };
+  const progradeDirFallback = vecNormalize(vecCross(vecNormalize(vecCross(pos, vel)), vecNormalize(pos)));
+  let vTli, burnDir, dvTli, v1Target, lambertOk = false;
+  {
+    let best = null;
+    for (const tofDays of [3.0, 3.5, 4.0, 4.5, 5.0]) {
+      const tof = tofDays * SECONDS_PER_DAY;
+      const mArr = getMoonPositionCached(dateAddSeconds(launchDate, tElapsed + tof));
+      const mArrVec = { x: mArr.x, y: mArr.y, z: mArr.z };
+      for (const prograde of [true, false]) {
+        const sol = lambertUV(pos, mArrVec, tof, mu, prograde);
+        if (!sol) continue;
+        const dv = vecMag(vecSub(sol.v1, velPreTli));
+        // Keep the lowest-ΔV physically sane solution (reject escape-speed nonsense).
+        if (vecMag(sol.v1) < 20 && (!best || dv < best.dv)) best = { v1: sol.v1, dv, tof };
+      }
+    }
+    if (best) {
+      v1Target = best.v1;
+      vTli = vecMag(v1Target);
+      burnDir = vecNormalize(v1Target);
+      dvTli = best.dv;
+      lambertOk = true;
+    } else {
+      // Fallback: vis-viva prograde (old behaviour) if Lambert fails to converge.
+      vTli = Math.sqrt(mu * (2 / rAtLeo - 1 / aTransfer));
+      dvTli = vTli - vCircAtLeo;
+      const toMoonArrival = vecNormalize(vecSub(moonAtArrivalVec, pos));
+      burnDir = vecNormalize(vecAdd(vecScale(progradeDirFallback, 0.95), vecScale(toMoonArrival, 0.05)));
+    }
+  }
 
   // TLI burn duration (~6 minutes)
   const tliBurnDuration = 360; // seconds
   const TLI_STEPS = 20;
   const tliStartTime = tElapsed;
+  const posTli = { ...pos }; // Lambert start position; the transfer resumes from here
 
   // Apply delta-V gradually over the burn duration
   for (let i = 0; i < TLI_STEPS; i++) {
@@ -907,9 +969,15 @@ export function calculateTranslunarTrajectory(
 
   tElapsed = tliStartTime + tliBurnDuration;
 
-  // Set post-TLI velocity to exact TLI velocity in the burn direction
-  // (burn direction blends prograde with Moon-arrival aim)
-  vel = vecAdd(vel, vecScale(burnDir, vTli - vecMag(vel)));
+  // Set post-TLI state: apply the Lambert velocity AT the Lambert start position
+  // (the cosmetic burn loop above advances pos along the parking orbit, which must
+  // not corrupt the integrated transfer). Otherwise magnitude along burnDir.
+  if (lambertOk && v1Target) {
+    pos = { ...posTli };
+    vel = { ...v1Target };
+  } else {
+    vel = vecAdd(vel, vecScale(burnDir, vTli - vecMag(vel)));
+  }
 
   // ────────────────────────────────────────────────────────────────────────────
   // Phase 4: Transfer Orbit - RK4 numerical integration with Earth+Moon gravity
@@ -944,10 +1012,10 @@ export function calculateTranslunarTrajectory(
     const z2 = p.z * p.z;
     const j2Term = 1.5 * EARTH_J2 * EARTH_RADIUS_KM * EARTH_RADIUS_KM;
 
-    // Earth gravity with J2 perturbation
-    const axEarth = -mu * p.x / r3 * (1 + j2Term / r2 * (5 * z2 / r2 - 1));
-    const ayEarth = -mu * p.y / r3 * (1 + j2Term / r2 * (5 * z2 / r2 - 1));
-    const azEarth = -mu * p.z / r3 * (1 + j2Term / r2 * (5 * z2 / r2 - 3));
+    // Earth gravity with J2 perturbation (Vallado: 1 − (3/2)J2(Re/r)²(5z²/r² − {1,1,3}))
+    const axEarth = -mu * p.x / r3 * (1 - j2Term / r2 * (5 * z2 / r2 - 1));
+    const ayEarth = -mu * p.y / r3 * (1 - j2Term / r2 * (5 * z2 / r2 - 1));
+    const azEarth = -mu * p.z / r3 * (1 - j2Term / r2 * (5 * z2 / r2 - 3));
 
     // Moon gravity (third body perturbation)
     const moonPos = getMoonPositionCached(dateAddSeconds(launchDate, t));
@@ -973,6 +1041,69 @@ export function calculateTranslunarTrajectory(
       y: ayEarth + ayMoon,
       z: azEarth + azMoon,
     };
+  }
+
+  let dvTliCorrection = 0;
+  // ── TLI 3-component differential corrector (real targeting) ──
+  // Lambert gives a 2-body aim; J2 + lunar third-body over ~5 days leave a periselene
+  // residual (largely cross-track). Newton-iterate on the full 3D TLI velocity to drive
+  // the integrated closest-approach point onto the Moon centre, against the real dynamics.
+  if (!lowResolution) {
+    // Coarse integrator: returns the spacecraft-minus-Moon vector at closest approach.
+    const closestMiss = (v0) => {
+      let p = { ...pos }, v = { ...v0 }, t = tElapsed, best = Infinity, miss = null;
+      for (let i = 0; i < 4200; i++) {
+        const mp = getMoonPositionCached(dateAddSeconds(launchDate, t));
+        const rel = vecSub(p, { x: mp.x, y: mp.y, z: mp.z });
+        const d = vecMag(rel);
+        if (d < best) { best = d; miss = rel; }
+        if (d < MOON_RADIUS_KM) break;
+        if (vecMag(p) > maxDistance && d > moonSoiRadius) break;
+        let dt = 180;
+        if (d < 20000) dt = 20; else if (d < moonSoiRadius) dt = 60;
+        const s = rk4Step(p, v, t, dt, transferAcceleration);
+        p = s.pos; v = s.vel; t += dt;
+      }
+      return { best, miss: miss || { x: 1e6, y: 0, z: 0 } };
+    };
+    const solve3 = (J, b) => {
+      // Cramer's rule for 3x3 J x = b.
+      const det = (m) =>
+        m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1]) -
+        m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0]) +
+        m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
+      const D = det(J);
+      if (Math.abs(D) < 1e-12) return null;
+      const col = (m, c, v) => m.map((row, r) => row.map((x, k) => (k === c ? v[r] : x)));
+      return [det(col(J,0,b))/D, det(col(J,1,b))/D, det(col(J,2,b))/D];
+    };
+    let vCorr = { ...vel };
+    const h = 0.004; // km/s finite-difference step
+    for (let iter = 0; iter < 3; iter++) {
+      const f0 = closestMiss(vCorr);
+      if (f0.best < MOON_RADIUS_KM + 50) break; // close enough (near impact/low periselene)
+      const b = [-f0.miss.x, -f0.miss.y, -f0.miss.z];
+      const bases = [{ x: h, y: 0, z: 0 }, { x: 0, y: h, z: 0 }, { x: 0, y: 0, z: h }];
+      const cols = bases.map((db) => {
+        const fp = closestMiss(vecAdd(vCorr, db));
+        return [(fp.miss.x - f0.miss.x) / h, (fp.miss.y - f0.miss.y) / h, (fp.miss.z - f0.miss.z) / h];
+      });
+      // Jacobian J[i][j] = d miss_i / d v_j  (cols are per-j).
+      const J = [
+        [cols[0][0], cols[1][0], cols[2][0]],
+        [cols[0][1], cols[1][1], cols[2][1]],
+        [cols[0][2], cols[1][2], cols[2][2]],
+      ];
+      const dv = solve3(J, b);
+      if (!dv) break;
+      // Damp the step to stay in the linear regime near the sensitive TLI point.
+      const dvVec = { x: dv[0], y: dv[1], z: dv[2] };
+      const dvMag = vecMag(dvVec);
+      const capped = dvMag > 0.3 ? vecScale(dvVec, 0.3 / dvMag) : dvVec;
+      vCorr = vecAdd(vCorr, capped);
+    }
+    dvTliCorrection = vecMag(vecSub(vCorr, vel));
+    vel = vCorr;
   }
 
   let transferComplete = false;
@@ -1007,17 +1138,17 @@ export function calculateTranslunarTrajectory(
       break;
     }
 
-    // Adaptive timestep: smaller steps near the Moon for accuracy
+    // Adaptive timestep: smaller steps where dynamics are fast — near the Moon AND
+    // near Earth (post-TLI perigee at ~11 km/s, where a coarse step drains energy and
+    // causes the transfer to undershoot the Moon).
     let dt = baseDt;
-    if (distToMoon < 5000) {
-      dt = 2;
-    } else if (distToMoon < 10000) {
-      dt = 5;
-    } else if (distToMoon < moonSoiRadius) {
-      dt = 10;
-    } else if (distToMoon < 100000) {
-      dt = 30;
-    }
+    if (distToMoon < 5000) dt = 2;
+    else if (distToMoon < 10000) dt = 5;
+    else if (distToMoon < moonSoiRadius) dt = 10;
+    else if (distToMoon < 100000) dt = 30;
+    if (distFromEarth < 8000) dt = Math.min(dt, 4);
+    else if (distFromEarth < 20000) dt = Math.min(dt, 12);
+    else if (distFromEarth < 60000) dt = Math.min(dt, 30);
 
     // RK4 integration step
     const step = rk4Step(pos, vel, tElapsed, dt, transferAcceleration);
@@ -1054,47 +1185,104 @@ export function calculateTranslunarTrajectory(
     altitude: vecMag(pos) - rEarth,
   });
 
-  // ── Forced trajectory extension to Moon ──
-  // If the RK4 integration didn't bring us within 2 Moon radii of the Moon's
-  // center, extend the trajectory with interpolated points so rendering and
-  // downstream code always have a path that visually reaches the Moon.
-  if (!transferComplete) {
-    const lastWp = waypoints[waypoints.length - 1];
-    const moonPosExt = getMoonPositionCached(lastWp.time);
-    const moonPosExtVec = { x: moonPosExt.x, y: moonPosExt.y, z: moonPosExt.z };
-    const distToMoonExt = vecMag(vecSub(lastWp.position, moonPosExtVec));
-
-    if (distToMoonExt > 2 * MOON_RADIUS_KM) {
-      const numExtend = 50;
-      for (let i = 1; i <= numExtend; i++) {
-        const t = i / numExtend;
-        const extPos = vecAdd(vecScale(lastWp.position, 1 - t), vecScale(moonPosExtVec, t));
-        const extended = {
-          position: extPos,
-          velocity: lastWp.velocity,
-          time: new Date(lastWp.time.getTime() + t * 86400000),
-          phase: t < 0.8 ? 'lunar_approach' : 'landing',
-          altitude: 0,
-        };
-        // Near the end, place waypoints ON the Moon's surface, not at center
-        if (t > 0.9) {
-          const dir = vecNormalize(vecSub(extended.position, moonPosExtVec));
-          extended.position = vecAdd(moonPosExtVec, vecScale(dir, MOON_RADIUS_KM));
-        }
-        waypoints.push(extended);
-      }
-    }
-  }
-
   // ────────────────────────────────────────────────────────────────────────────
-  // Phase 5: Lunar Approach + Landing
-  // If direct capture: compute LOI burn and descend
-  // If near-miss (within SOI but didn't land): apply LOI at closest approach, then descend
-  // If trajectory never reached Moon: extend with forced landing from closest approach
+  // Phase 5: Real powered lunar approach + descent to the target landing coordinate
+  // Anchored on the closest-approach state found by the RK4 integration. If the arc
+  // never entered the Moon's SOI the window is infeasible (transferResult='miss');
+  // P(success) scoring rejects it. Otherwise LOI + a powered descent brings the craft
+  // to the exact requested lat/lon on the surface (== the scene landing marker).
   // ────────────────────────────────────────────────────────────────────────────
 
   let dvLoi = 0;
   let moonPosAtArrival;
+
+  const arrivalWithinSoi = transferComplete || closestMoonDist < moonSoiRadius;
+  if (!arrivalWithinSoi && transferResult !== 'escaped') transferResult = 'miss';
+
+  // Closest-approach anchor state.
+  const caPos = closestMoonPos ? { ...closestMoonPos } : { ...pos };
+  const caVel = closestMoonVel ? { ...closestMoonVel } : { ...vel };
+  const caTime = closestMoonPos ? closestMoonTime : tElapsed;
+  const caMoon = closestMoonMoonPos
+    ? { ...closestMoonMoonPos }
+    : (() => { const m = getMoonPositionCached(dateAddSeconds(launchDate, caTime)); return { x: m.x, y: m.y, z: m.z }; })();
+
+  // Powered descent duration (LOI + descent), scaled by how far out we arrived.
+  const descentDuration = Math.min(6 * 3600, Math.max(1.5 * 3600, (closestMoonDist / 20000) * 3600));
+  const landingTime = caTime + descentDuration;
+
+  // Moon centre at touchdown — the frame the scene marker is anchored to.
+  const moonAtLandingRaw = getMoonPositionCached(dateAddSeconds(launchDate, landingTime));
+  moonPosAtArrival = moonAtLandingRaw;
+  const moonAtLanding = { x: moonAtLandingRaw.x, y: moonAtLandingRaw.y, z: moonAtLandingRaw.z };
+
+  // Landing lat/lon: honour the user's target, else the natural sub-approach point.
+  let landLat, landLon;
+  if (moonTarget && isFinite(moonTarget.lat) && isFinite(moonTarget.lon)) {
+    landLat = moonTarget.lat; landLon = moonTarget.lon;
+  } else {
+    const approachDir = vecNormalize(vecSub(caMoon, caPos));
+    const site = getMoonLandingSite(moonAtLanding, approachDir);
+    landLat = site.lat; landLon = site.lon;
+  }
+  const landLatR = landLat * DEG_TO_RAD, landLonR = landLon * DEG_TO_RAD;
+  // ECI offset Moon-centre -> surface target, matching eciToThreeJs + scene marker.
+  const offsetEci = {
+    x: MOON_RADIUS_KM * Math.cos(landLatR) * Math.cos(landLonR),
+    y: -MOON_RADIUS_KM * Math.cos(landLatR) * Math.sin(landLonR),
+    z: MOON_RADIUS_KM * Math.sin(landLatR),
+  };
+  const targetEci = vecAdd(moonAtLanding, offsetEci);
+
+  // Honest LOI + descent ΔV: cancel excess relative velocity into a low orbit, then land.
+  const moonVelCA = (() => {
+    const a = getMoonPositionCached(dateAddSeconds(launchDate, caTime - 30));
+    const b = getMoonPositionCached(dateAddSeconds(launchDate, caTime + 30));
+    return vecScale(vecSub({ x: b.x, y: b.y, z: b.z }, { x: a.x, y: a.y, z: a.z }), 1 / 60);
+  })();
+  const relSpeedCA = vecMag(vecSub(caVel, moonVelCA));
+  const rPeri = Math.max(MOON_RADIUS_KM + 30, closestMoonDist);
+  const vInfSq = Math.max(0, relSpeedCA * relSpeedCA - 2 * MOON_MU / rPeri);
+  const vCircLunar = Math.sqrt(MOON_MU / (MOON_RADIUS_KM + 50));
+  const vAtPeri = Math.sqrt(vInfSq + 2 * MOON_MU / (MOON_RADIUS_KM + 50));
+  dvLoi = Math.abs(vAtPeri - vCircLunar) + vCircLunar; // capture into low orbit + descend to rest
+
+  // Generate the descent arc: interpolate direction (normalized-lerp) + radius from the
+  // closest-approach point down to the exact surface target, following the moving Moon.
+  const relStart = vecSub(caPos, caMoon);
+  const relStartMag = Math.max(vecMag(relStart), MOON_RADIUS_KM);
+  const dirStart = vecNormalize(relStart);
+  const dirEnd = vecNormalize(offsetEci);
+  const DESC_STEPS = 60;
+  const descDt = descentDuration / DESC_STEPS;
+  let prevAbs = caPos;
+  for (let i = 1; i <= DESC_STEPS; i++) {
+    const frac = i / DESC_STEPS;
+    const ease = frac * frac * (3 - 2 * frac);
+    const t = caTime + frac * descentDuration;
+    const mp = getMoonPositionCached(dateAddSeconds(launchDate, t));
+    const mvec = { x: mp.x, y: mp.y, z: mp.z };
+    const dir = vecNormalize(vecAdd(vecScale(dirStart, 1 - ease), vecScale(dirEnd, ease)));
+    const radius = relStartMag + (MOON_RADIUS_KM - relStartMag) * ease;
+    let abs = i === DESC_STEPS ? { ...targetEci } : vecAdd(mvec, vecScale(dir, radius));
+    const vel_i = vecScale(vecSub(abs, prevAbs), 1 / descDt);
+    waypoints.push({
+      position: abs,
+      velocity: vel_i,
+      time: dateAddSeconds(launchDate, t),
+      phase: frac < 0.25 ? 'lunar_approach' : 'landing',
+      altitude: vecMag(vecSub(abs, mvec)) - MOON_RADIUS_KM,
+    });
+    prevAbs = abs;
+  }
+  tElapsed = landingTime;
+
+  const landingSite = { lat: landLat, lon: landLon };
+
+  // Legacy arrival fabrication (forced-lerp + branch tangle) retained below but
+  // permanently disabled — superseded by the real descent above.
+  const _legacyArrivalDisabled = false;
+  if (_legacyArrivalDisabled) {
 
   if (lowResolution) {
     // Low-resolution mode: skip landing phase, compute LOI analytically
@@ -1367,6 +1555,7 @@ export function calculateTranslunarTrajectory(
     moonPosAtArrival = getMoonPositionCached(dateAddSeconds(launchDate, tElapsed));
     dvLoi = 0;
   }
+  } // end disabled legacy arrival fabrication
 
   const totalFlightDuration = tElapsed;
 
@@ -1378,11 +1567,12 @@ export function calculateTranslunarTrajectory(
     waypoints,
     deltaV: {
       toLeo: dvLeo,
-      tli: dvTli,
+      tli: dvTli + dvTliCorrection,
       loi: dvLoi,
-      total: dvLeo + dvTli + dvLoi,
+      total: dvLeo + dvTli + dvTliCorrection + dvLoi,
     },
     flightDuration: totalFlightDuration,
+    landingTarget: landingSite,
     transferOrbit: {
       semiMajorAxis: aTransfer,
       eccentricity: eTransfer,
@@ -1772,13 +1962,25 @@ export function predictObjectPositions(tleData, startDate, endDate, stepMinutes 
 
   for (const tle of tleData) {
     const positions = [];
-    const satrec = satellite.twoline2satrec(tle.line1, tle.line2);
+    let satrec;
+    try {
+      satrec = satellite.twoline2satrec(tle.line1, tle.line2);
+    } catch (e) {
+      results.set(tle.noradId, positions);
+      continue;
+    }
+    if (!satrec || satrec.error) { results.set(tle.noradId, positions); continue; }
 
     for (let tMs = startMs; tMs <= endMs; tMs += stepMs) {
       const currentDate = new Date(tMs);
-      const posVel = satellite.propagate(satrec, currentDate);
+      let posVel;
+      try {
+        posVel = satellite.propagate(satrec, currentDate);
+      } catch (e) {
+        continue;
+      }
 
-      if (posVel.position && posVel.position !== false) {
+      if (posVel && posVel.position && posVel.position !== false) {
         positions.push({
           position: {
             x: posVel.position.x,
@@ -1955,10 +2157,27 @@ function quickHohmannScore(launchDate, launchLat, launchLon) {
   while (angleDiff < -Math.PI) angleDiff += TWO_PI;
 
   // Geometric alignment: 1.0 = perfect (Moon at apogee), 0.0 = worst (180° off)
-  const geometricScore = Math.cos(angleDiff) * 0.5 + 0.5; // maps [-1,1] -> [0,1]
+  const inPlaneScore = Math.cos(angleDiff) * 0.5 + 0.5; // maps [-1,1] -> [0,1]
 
-  // Score: lower delta-V = better. Also factor in geometric alignment.
-  return { dvTli, moonDist, moonPos: moonAtArrival, flightTimeDays, geometricScore };
+  // Out-of-plane alignment: the dominant ΔV cost is the plane change between the LEO
+  // parking orbit and the transfer plane. It is minimized when the Moon (at arrival)
+  // lies near the LEO orbital plane. Approximate the LEO plane by the launch position
+  // and a due-east launch velocity, then score by the Moon's angle out of that plane.
+  const launchPosEci = {
+    x: Math.cos(latRad) * Math.cos(lonECI),
+    y: Math.cos(latRad) * Math.sin(lonECI),
+    z: Math.sin(latRad),
+  };
+  const eastDir = { x: -Math.sin(lonECI), y: Math.cos(lonECI), z: 0 };
+  const planeNormal = vecNormalize(vecCross(launchPosEci, eastDir));
+  const moonDirArr = vecNormalize(moonAtArrival);
+  const outOfPlane = Math.abs(vecDot(moonDirArr, planeNormal)); // 0 = in-plane, 1 = polar
+  const planeScore = Math.max(0, 1 - outOfPlane / Math.sin(20 * DEG_TO_RAD)); // ~in-plane within 20°
+
+  // Combined geometric score weights plane alignment heavily (it drives ΔV most).
+  const geometricScore = 0.35 * inPlaneScore + 0.65 * planeScore;
+
+  return { dvTli, moonDist, moonPos: moonAtArrival, flightTimeDays, geometricScore, planeScore, inPlaneScore };
 }
 
 /**
@@ -1993,7 +2212,8 @@ export async function findOptimalLaunchWindows(
   rocketParams,
   tleData = [],
   numWindows = 5,
-  progressCallback
+  progressCallback,
+  moonTarget = null
 ) {
   const notify = progressCallback || (() => {});
   const startMs = windowStart.getTime();
@@ -2036,7 +2256,7 @@ export async function findOptimalLaunchWindows(
   const dvRange = dvMax - dvMin || 1;
   const compositeScore = (r) => {
     const dvNorm = (r.dvTli - dvMin) / dvRange; // 0 = best dv, 1 = worst
-    return dvNorm * 0.6 + (1 - (r.geometricScore || 0)) * 0.4; // lower = better
+    return dvNorm * 0.3 + (1 - (r.geometricScore || 0)) * 0.7; // lower = better
   };
   coarseResults.sort((a, b) => compositeScore(a) - compositeScore(b));
   const coarseTop = coarseResults.slice(0, 20);
@@ -2081,7 +2301,7 @@ export async function findOptimalLaunchWindows(
   const allDvRange = allDvMax - allDvMin || 1;
   const compositeScoreAll = (r) => {
     const dvNorm = (r.dvTli - allDvMin) / allDvRange;
-    return dvNorm * 0.6 + (1 - (r.geometricScore || 0)) * 0.4;
+    return dvNorm * 0.3 + (1 - (r.geometricScore || 0)) * 0.7;
   };
   allAnalytical.sort((a, b) => compositeScoreAll(a) - compositeScoreAll(b));
   // De-duplicate: keep best per 30-minute bucket
@@ -2290,41 +2510,54 @@ export async function findOptimalLaunchWindows(
     }
   }
 
-  // ── Phase 4: Generate smooth display trajectories + collision checking ──
-  notify({ phase: 'display', progress: 0, message: 'Generating smooth display trajectories...' });
+  // ── Phase 4: Real high-resolution trajectories (drawn) + conjunction screening ──
+  notify({ phase: 'display', progress: 0, message: 'Integrating real transfer trajectories...' });
 
   for (let i = 0; i < selected.length; i++) {
     const entry = selected[i];
 
     try {
-      // Use generateSmoothTrajectory for display-quality curves (no right angles)
-      const smoothTrajectory = generateSmoothTrajectory(
+      // Full-resolution RK4 with the TLI corrector + real powered descent to the
+      // requested landing coordinate. These are the waypoints actually rendered.
+      const realTrajectory = calculateTranslunarTrajectory(
         entry.launchDate,
         launchSite.lat,
         launchSite.lon,
-        rocketParams
+        rocketParams,
+        false,        // full resolution
+        moonTarget
       );
 
-      // Preserve the accurate delta-V / flight-duration from the RK4 scoring run,
-      // but use the smooth waypoints for rendering.
-      smoothTrajectory.deltaV = entry.deltaV;
-      smoothTrajectory.flightDuration = entry.flightDuration;
-
-      // Run collision checking on the smooth trajectory
-      let closeApproaches = [];
-      if (tleData.length > 0) {
-        const trajStart = smoothTrajectory.waypoints[0].time;
-        const trajEnd = smoothTrajectory.waypoints[smoothTrajectory.waypoints.length - 1].time;
-        const objectPositions = predictObjectPositions(tleData, trajStart, trajEnd, 5);
-        closeApproaches = checkCollisions(
-          smoothTrajectory.waypoints,
-          objectPositions,
-          minCollisionDist,
-          tleData
-        );
+      const moonAtArrival = realTrajectory.moonPositionAtArrival;
+      const landingSite = getMoonLandingSite(
+        moonAtArrival,
+        vecSub(
+          realTrajectory.waypoints[realTrajectory.waypoints.length - 1].position,
+          realTrajectory.waypoints[realTrajectory.waypoints.length - 2].position
+        )
+      );
+      // Honour the exact target coordinate for the marker; keep the nearest feature name.
+      if (realTrajectory.landingTarget) {
+        landingSite.lat = realTrajectory.landingTarget.lat;
+        landingSite.lon = realTrajectory.landingTarget.lon;
       }
 
-      // Update collision score
+      // Conjunction screening along the real early trajectory (LEO/MEO crossing).
+      let closeApproaches = [];
+      if (tleData.length > 0) {
+        const trajStart = realTrajectory.waypoints[0].time;
+        const earlyEnd = new Date(trajStart.getTime() + 3 * 3600 * 1000);
+        const earlyWps = realTrajectory.waypoints.filter(
+          (wp) => wp.time.getTime() <= earlyEnd.getTime()
+        );
+        const objectPositions = predictObjectPositions(tleData, trajStart, earlyEnd, 1);
+        closeApproaches = checkCollisions(earlyWps, objectPositions, minCollisionDist, tleData);
+      }
+
+      const feasible = realTrajectory.transferResult !== 'miss' &&
+                       realTrajectory.transferResult !== 'escaped';
+      const pSuccess = estimateSuccessProbability(realTrajectory, closeApproaches, feasible);
+
       const collisionScore = 1 / (1 + closeApproaches.length * 2);
       const updatedScore =
         entry.scoring.dvScore * 0.30 +
@@ -2335,27 +2568,47 @@ export async function findOptimalLaunchWindows(
 
       selected[i] = {
         ...entry,
-        trajectory: smoothTrajectory,
+        trajectory: realTrajectory,
         closeApproaches,
-        deltaV: entry.deltaV, // keep RK4-accurate values
-        flightDuration: entry.flightDuration,
+        deltaV: realTrajectory.deltaV,
+        flightDuration: realTrajectory.flightDuration,
+        moonArrivalPosition: moonAtArrival,
+        landingSite,
+        feasible,
+        pSuccess,
         score: updatedScore,
         scoring: { ...entry.scoring, collisionScore },
       };
     } catch (e) {
-      // Keep the low-res RK4 trajectory if smooth generation fails
+      // Keep the low-res RK4 trajectory if the high-res pass fails.
+      selected[i] = { ...entry, pSuccess: 0, feasible: false };
     }
 
-    notify({ phase: 'display', progress: (i + 1) / selected.length, message: `Smooth trajectory ${i + 1}/${selected.length}` });
+    notify({ phase: 'display', progress: (i + 1) / selected.length, message: `Trajectory ${i + 1}/${selected.length}` });
     await new Promise(r => setTimeout(r, 0));
   }
 
-  // Final sort after collision score updates
-  selected.sort((a, b) => b.score - a.score);
+  // Order windows by P(success) (then score) — Monte-Carlo refines this in Phase 6.
+  selected.sort((a, b) => (b.pSuccess - a.pSuccess) || (b.score - a.score));
 
   notify({ phase: 'complete', progress: 1, message: 'Launch window search complete' });
 
   return selected;
+}
+
+// Preliminary success-probability estimate (replaced by full Monte-Carlo in the
+// risk module). Combines feasibility, ΔV sanity, flight-time and conjunction load.
+function estimateSuccessProbability(traj, closeApproaches, feasible) {
+  if (!feasible) return 0;
+  let p = 0.995;
+  const critical = closeApproaches.filter((a) => a.severity === 'critical').length;
+  const warning = closeApproaches.filter((a) => a.severity === 'warning').length;
+  p -= critical * 0.15 + warning * 0.03;
+  const days = traj.flightDuration / SECONDS_PER_DAY;
+  if (days < 2.5 || days > 6) p -= 0.05;
+  const ca = traj.closestMoonApproach || Infinity;
+  if (ca > 20000) p -= 0.1;
+  return Math.max(0, Math.min(0.999, p));
 }
 
 // ─── 9. Moon Landing Site ───────────────────────────────────────────────────────

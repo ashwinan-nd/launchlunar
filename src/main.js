@@ -44,6 +44,17 @@ const MOON_TARGETS = [
   'Tycho Crater',
 ];
 
+// Real selenographic coordinates for the named targets (null = automatic).
+const MOON_TARGET_COORDS = {
+  'Automatic (optimal landing site)': null,
+  'Mare Tranquillitatis (Apollo 11 site)': { lat: 0.67, lon: 23.47 },
+  'Oceanus Procellarum': { lat: 18.4, lon: -57.4 },
+  'Mare Imbrium': { lat: 32.8, lon: -15.6 },
+  'South Pole (Shackleton Crater)': { lat: -89.9, lon: 0 },
+  'Aristarchus Plateau': { lat: 23.7, lon: -47.4 },
+  'Tycho Crater': { lat: -43.3, lon: -11.4 },
+};
+
 const CATEGORY_DISPLAY = [
   { key: 'satellite', label: 'Satellites', color: '#AA66FF' },
   { key: 'starlink', label: 'Starlink', color: '#00BFFF' },
@@ -1223,23 +1234,48 @@ function renderResultsPanel(windows, formValues) {
   panel.appendChild(el('div', { className: 'results-header', style: { marginTop: '-4px', marginBottom: '12px' } },
     'OPTIMAL LAUNCH WINDOWS'));
 
+  // 98% success threshold: if no window clears it, tell the user to widen the range.
+  const anyFeasible = windows.some((w) => (w.pSuccess ?? 0) >= 0.98);
+  if (!anyFeasible) {
+    const best = Math.max(0, ...windows.map((w) => (w.pSuccess ?? 0) * 100));
+    panel.appendChild(el('div', {
+      className: 'window-warning',
+      style: {
+        background: 'rgba(255,140,0,0.12)', border: '1px solid rgba(255,140,0,0.4)',
+        borderRadius: '6px', padding: '10px', marginBottom: '10px',
+        fontSize: '0.72rem', color: '#ffb060', lineHeight: '1.5',
+      },
+    }, `No launch window reaches the 98% success threshold (best: ${best.toFixed(1)}%). Widen your launch-window month range for more opportunities.`));
+  }
+
+  const craterLabel = (w) => {
+    const t = formValues.moonTarget;
+    if (t && !t.startsWith('Automatic')) return t.replace(/\s*\(.*\)$/, '');
+    return w.landingSite.craterName;
+  };
+
   windows.forEach((w, idx) => {
     const flightDays = (w.flightDuration / 86400).toFixed(1);
     const dvTotal = w.deltaV.total.toFixed(2);
+    const pSucc = ((w.pSuccess ?? 0) * 100).toFixed(1);
+    const pColor = (w.pSuccess ?? 0) >= 0.98 ? '#00e08a' : (w.pSuccess ?? 0) >= 0.9 ? '#ffcc44' : '#ff6b6b';
+    const critical = (w.closeApproaches || []).filter((a) => a.severity === 'critical' || a.severity === 'warning').length;
     const card = el('div', {
       className: `window-card${idx === 0 ? ' selected' : ''}`,
       id: `window-card-${idx}`,
     },
       el('div', { className: 'window-card-rank' }, `#${idx + 1}`),
       el('div', { className: 'window-card-date' }, formatDateTime(w.launchDate)),
+      el('div', { style: { fontSize: '0.95rem', fontWeight: '700', color: pColor, margin: '2px 0 6px' } },
+        `P(success): ${pSucc}%`),
       el('div', { className: 'window-card-stats' },
         el('span', null, el('span', { className: 'stat-label' }, 'Delta-V: '), `${dvTotal} km/s`),
         el('span', null, el('span', { className: 'stat-label' }, 'Flight: '), `${flightDays} days`),
-        el('span', null, el('span', { className: 'stat-label' }, 'Close: '), `${w.closeApproaches.length} objects`),
-        el('span', null, el('span', { className: 'stat-label' }, 'Score: '), `${(w.score * 100).toFixed(1)}`),
+        el('span', null, el('span', { className: 'stat-label' }, 'High-risk: '), `${critical} objects`),
+        el('span', null, el('span', { className: 'stat-label' }, 'Screened: '), `${w.closeApproaches.length}`),
         el('span', { style: { gridColumn: '1 / -1' } },
           el('span', { className: 'stat-label' }, 'Landing: '),
-          w.landingSite.craterName,
+          craterLabel(w),
         ),
       ),
     );
@@ -2040,6 +2076,9 @@ async function handleLaunch() {
     // Build TLE data subset for conjunction screening from the real catalog.
     const tleDataForWindows = buildScreeningSet();
 
+    // Resolve the requested Moon target to selenographic coordinates (null = auto).
+    const moonTargetCoords = MOON_TARGET_COORDS[values.moonTarget] || null;
+
     showSidebarLoading('Finding optimal launch windows...', 40);
     await new Promise((r) => setTimeout(r, 30));
 
@@ -2055,7 +2094,8 @@ async function handleLaunch() {
         (progress, message) => {
           const pct = 40 + progress * 50;
           showSidebarLoading(message || 'Computing trajectories...', pct);
-        }
+        },
+        moonTargetCoords
       );
     } catch (e) {
       console.error('Window computation failed:', e);
@@ -2068,8 +2108,9 @@ async function handleLaunch() {
         const { calculateTranslunarTrajectory } = await import('./orbital.js');
         const fallbackDate = values.windowStart;
         const trajectory = calculateTranslunarTrajectory(
-          fallbackDate, values.lat, values.lon, rocketParams, false
+          fallbackDate, values.lat, values.lon, rocketParams, false, moonTargetCoords
         );
+        const fbLanding = trajectory.landingTarget || { lat: 0, lon: 0 };
         const moonAtArrival = getMoonPosition(new Date(fallbackDate.getTime() + 3.5 * 86400000));
         windows = [{
           launchDate: fallbackDate,
@@ -2078,8 +2119,10 @@ async function handleLaunch() {
           closeApproaches: [],
           deltaV: trajectory.deltaV,
           flightDuration: trajectory.flightDuration,
-          moonArrivalPosition: moonAtArrival,
-          landingSite: { lat: 0, lon: 0, craterName: 'Mare Tranquillitatis', terrainType: 'mare' },
+          moonArrivalPosition: trajectory.moonPositionAtArrival || moonAtArrival,
+          landingSite: { lat: fbLanding.lat, lon: fbLanding.lon, craterName: values.moonTarget || 'Mare Tranquillitatis', terrainType: 'mare' },
+          pSuccess: 0.5,
+          feasible: trajectory.transferResult !== 'miss',
         }];
       } catch (e) {
         console.error('Fallback trajectory failed:', e);
