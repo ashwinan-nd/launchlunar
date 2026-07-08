@@ -1,6 +1,11 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
+  // satellite.js's WASM/pthreads worker bootstrap uses top-level await, which the
+  // default 'iife' worker output format cannot emit. Bundle workers as ES modules.
+  worker: {
+    format: 'es',
+  },
   server: {
     port: 5173,
     host: true,

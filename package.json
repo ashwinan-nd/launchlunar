@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "node scripts/test-physics.mjs",
+    "validate:500": "node scripts/validate-500.mjs",
     "fetch:catalog": "node scripts/fetch-spacetrack.mjs",
     "verify": "node scripts/verify.mjs"
   },

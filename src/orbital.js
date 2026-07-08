@@ -139,7 +139,7 @@ function dateAddSeconds(date, sec) {
 
 // ─── GMST Computation ──────────────────────────────────────────────────────────
 
-function computeGmst(date) {
+export function computeGmst(date) {
   return satellite.gstime(date);
 }
 
@@ -1323,6 +1323,25 @@ export function calculateTranslunarTrajectory(
   const vCircLunar = Math.sqrt(MOON_MU / (MOON_RADIUS_KM + 50));
   const vAtPeri = Math.sqrt(vInfSq + 2 * MOON_MU / (MOON_RADIUS_KM + 50));
   dvLoi = Math.abs(vAtPeri - vCircLunar) + vCircLunar; // capture into low orbit + descend to rest
+
+  // The RK4 loop may have kept integrating PAST closest approach (fly-away tail on a
+  // near-miss flyby). That tail is discarded — the powered descent replaces it and is
+  // anchored at caTime. Drop any transfer waypoints recorded after caTime so waypoint
+  // time stays monotonic across the splice, then anchor exactly at the closest-approach
+  // state.
+  const caTimeMs = launchDate.getTime() + caTime * 1000;
+  while (waypoints.length > 1 && waypoints[waypoints.length - 1].time.getTime() > caTimeMs + 1) {
+    waypoints.pop();
+  }
+  if (waypoints.length === 0 || waypoints[waypoints.length - 1].time.getTime() < caTimeMs - 1) {
+    waypoints.push({
+      position: { ...caPos },
+      velocity: { ...caVel },
+      time: new Date(caTimeMs),
+      phase: 'lunar_approach',
+      altitude: vecMag(vecSub(caPos, caMoon)) - MOON_RADIUS_KM,
+    });
+  }
 
   // Generate the descent arc: interpolate direction (normalized-lerp) + radius from the
   // closest-approach point down to the exact surface target, following the moving Moon.
@@ -2615,12 +2634,23 @@ export async function findOptimalLaunchWindows(
     const durationScore = Math.max(0, 1 - Math.abs(flightDays - 3.5) / 3);
     const captureBonus = trajectory.transferResult === 'capture' ? 0.2 : 0;
 
+    // Skip infeasible transfers (never entered the Moon SOI = 'miss', or 'escaped').
+    // They must not be ranked, and must not be available for backfill.
+    if (trajectory.transferResult === 'miss' || trajectory.transferResult === 'escaped') {
+      continue;
+    }
+
+    // Moon-geometry / phase-alignment score from the analytical pre-screen — this is
+    // what determines whether the Moon will actually BE where the transfer arrives.
+    const geometricScore = candidate.geometricScore || 0;
+
     const score =
-      dvScore * 0.30 +
-      collisionScore * 0.25 +
-      efficiencyScore * 0.15 +
-      durationScore * 0.15 +
-      captureBonus * 0.15;
+      dvScore * 0.25 +
+      collisionScore * 0.20 +
+      efficiencyScore * 0.10 +
+      durationScore * 0.10 +
+      captureBonus * 0.05 +
+      geometricScore * 0.30;
 
     candidates.push({
       launchDate: candidateDate,
@@ -2631,6 +2661,7 @@ export async function findOptimalLaunchWindows(
       flightDuration: trajectory.flightDuration,
       moonArrivalPosition: moonAtArrival,
       landingSite,
+      geometricScore,
       scoring: { dvScore, collisionScore, efficiencyScore, durationScore, captureBonus },
     });
   }
@@ -2653,10 +2684,12 @@ export async function findOptimalLaunchWindows(
     }
   }
 
-  // Fill remaining if needed
+  // Fill remaining if needed — but never backfill infeasible transfers.
   if (selected.length < numWindows) {
     for (const candidate of candidates) {
       if (selected.length >= numWindows) break;
+      const tr = candidate.trajectory && candidate.trajectory.transferResult;
+      if (tr === 'miss' || tr === 'escaped') continue;
       if (!selected.includes(candidate)) {
         selected.push(candidate);
       }
@@ -2712,11 +2745,12 @@ export async function findOptimalLaunchWindows(
 
       const collisionScore = 1 / (1 + closeApproaches.length * 2);
       const updatedScore =
-        entry.scoring.dvScore * 0.30 +
-        collisionScore * 0.25 +
-        entry.scoring.efficiencyScore * 0.15 +
-        entry.scoring.durationScore * 0.15 +
-        entry.scoring.captureBonus * 0.15;
+        entry.scoring.dvScore * 0.25 +
+        collisionScore * 0.20 +
+        entry.scoring.efficiencyScore * 0.10 +
+        entry.scoring.durationScore * 0.10 +
+        entry.scoring.captureBonus * 0.05 +
+        (entry.geometricScore || 0) * 0.30;
 
       selected[i] = {
         ...entry,
@@ -2740,12 +2774,31 @@ export async function findOptimalLaunchWindows(
     await new Promise(r => setTimeout(r, 0));
   }
 
+  // Drop any window that turned out infeasible in the full-resolution pass.
+  const feasibleWindows = selected.filter((w) => w.feasible);
+
   // Order windows by P(success) (then score) — Monte-Carlo refines this in Phase 6.
-  selected.sort((a, b) => (b.pSuccess - a.pSuccess) || (b.score - a.score));
+  feasibleWindows.sort((a, b) => (b.pSuccess - a.pSuccess) || (b.score - a.score));
 
   notify({ phase: 'complete', progress: 1, message: 'Launch window search complete' });
 
-  return selected;
+  // The app targets a 98% P(success) threshold. If no feasible window exists, or none
+  // clears that threshold, return an empty array with a reason so the UI can prompt the
+  // user to widen the date range.
+  const PSUCCESS_THRESHOLD = 0.98;
+  if (feasibleWindows.length === 0) {
+    const empty = [];
+    empty.reason = 'No feasible trans-lunar transfer was found in this date range. Widen your launch-window month range for more opportunities.';
+    return empty;
+  }
+  if (!feasibleWindows.some((w) => (w.pSuccess ?? 0) >= PSUCCESS_THRESHOLD)) {
+    const best = Math.max(0, ...feasibleWindows.map((w) => (w.pSuccess ?? 0) * 100));
+    const empty = [];
+    empty.reason = `No launch window reaches the 98% success threshold (best: ${best.toFixed(1)}%). Widen your launch-window month range for more opportunities.`;
+    return empty;
+  }
+
+  return feasibleWindows;
 }
 
 // Preliminary success-probability estimate (replaced by full Monte-Carlo in the

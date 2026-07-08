@@ -1,6 +1,19 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import gsap from 'gsap';
+import { SelectiveBloom, BLOOM_LAYER } from './postprocessing.js';
+
+// LOD: camera distance (Earth radii, camera-to-origin) below which the 3D
+// instanced glyph tier replaces the flat THREE.Points billboards. Kept below
+// the ~5.4-radii default view so the whole-Earth view stays on fast Points.
+const LOD_NEAR_DIST = 4.0;
+// Objects within this distance of the camera are promoted to instanced glyphs.
+const LOD_INSTANCE_CUTOFF = 5.0;
+// Per-category instance cap (bounds worst-case draw / matrix churn).
+const LOD_MAX_PER_CATEGORY = 12000;
+// Rebuild the visible instanced subset every N frames (not every frame).
+const LOD_REBUILD_INTERVAL = 8;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -64,8 +77,76 @@ function getPointSize(category) {
 }
 
 // RCS size class -> relative scale multiplier (real objects sized by radar cross-section).
+// Global glyph-size damper: the base geometries are visibility-exaggerated, so at
+// close LOD thousands of LEO objects overlapped into a solid wall. 0.5 keeps them
+// individually readable while still visible.
+const GLYPH_SIZE = 0.5;
 const RCS_SCALE = { LARGE: 2.2, MEDIUM: 1.45, SMALL: 0.95 };
-function rcsScale(rcs) { return RCS_SCALE[rcs] ?? 0.85; }
+function rcsScale(rcs) { return (RCS_SCALE[rcs] ?? 0.85) * GLYPH_SIZE; }
+
+// Frame-rate-independent exponential damping (spec §8.1).
+// Returns the new value moved toward target; identical convergence at any dt.
+function damp(current, target, lambda, dt) {
+  return target + (current - target) * Math.exp(-lambda * dt);
+}
+function dampVec3(current, target, lambda, dt) {
+  const k = 1 - Math.exp(-lambda * dt);
+  current.x += (target.x - current.x) * k;
+  current.y += (target.y - current.y) * k;
+  current.z += (target.z - current.z) * k;
+}
+
+// ---------------------------------------------------------------------------
+// 3D glyph geometries for the instanced mid/near-LOD tier — objects "look like
+// what they are" when zoomed in. Small (scene units; Earth radius = 1) and
+// merged so each category renders in a single draw call.
+// ---------------------------------------------------------------------------
+function buildSatelliteGlyphGeometry() {
+  const body = new THREE.BoxGeometry(0.006, 0.006, 0.009);
+  const panelL = new THREE.BoxGeometry(0.016, 0.0008, 0.006).translate(-0.013, 0, 0);
+  const panelR = new THREE.BoxGeometry(0.016, 0.0008, 0.006).translate(0.013, 0, 0);
+  const geo = mergeGeometries([body, panelL, panelR]);
+  body.dispose(); panelL.dispose(); panelR.dispose();
+  return geo;
+}
+function buildDebrisGlyphGeometry() {
+  // Irregular: jitter an icosahedron's vertices for a non-uniform silhouette.
+  const geo = new THREE.IcosahedronGeometry(0.005, 0);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const j = 0.45 + Math.random() * 0.75;
+    pos.setXYZ(i, pos.getX(i) * j, pos.getY(i) * j, pos.getZ(i) * j);
+  }
+  geo.computeVertexNormals();
+  return geo;
+}
+function buildRocketGlyphGeometry() {
+  const geo = new THREE.CylinderGeometry(0.0028, 0.0028, 0.018, 8);
+  return geo;
+}
+function buildStationGlyphGeometry() {
+  const body = new THREE.BoxGeometry(0.008, 0.008, 0.014);
+  const truss = new THREE.BoxGeometry(0.03, 0.0012, 0.007);
+  const geo = mergeGeometries([body, truss]);
+  body.dispose(); truss.dispose();
+  return geo;
+}
+function buildNavGlyphGeometry() {
+  return new THREE.OctahedronGeometry(0.007, 0);
+}
+function buildDefaultGlyphGeometry() {
+  return new THREE.BoxGeometry(0.007, 0.007, 0.007);
+}
+function buildGlyphGeometry(shape) {
+  switch (shape) {
+    case 'satellite': return buildSatelliteGlyphGeometry();
+    case 'debris': return buildDebrisGlyphGeometry();
+    case 'rocket': return buildRocketGlyphGeometry();
+    case 'station': return buildStationGlyphGeometry();
+    case 'nav': return buildNavGlyphGeometry();
+    default: return buildDefaultGlyphGeometry();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Per-category glyph textures — objects "look like what they are"
@@ -190,15 +271,21 @@ function loadTexture(...urls) {
 }
 
 // ---------------------------------------------------------------------------
-// Earth Day/Night Shader — fully opaque, vegetation boost
+// Earth Day/Night Shader — opaque, tangent-space normal map, sigmoid
+// terminator, real ocean-mask specular, cloud self-shadow.
 // ---------------------------------------------------------------------------
-function createEarthShaderMaterial(dayTex, nightTex, bumpTex) {
+function createEarthShaderMaterial(dayTex, nightTex, normalTex, specularTex, cloudTex) {
   const uniforms = {
     dayTexture: { value: dayTex },
     nightTexture: { value: nightTex },
-    bumpTexture: { value: bumpTex },
+    normalMap: { value: normalTex },
+    specularMap: { value: specularTex },
+    cloudTexture: { value: cloudTex },
     sunDirection: { value: new THREE.Vector3(1.0, 0.3, 0.5).normalize() },
-    bumpScale: { value: 0.03 },
+    normalScale: { value: 1.1 },
+    hasNormal: { value: normalTex ? 1.0 : 0.0 },
+    hasSpecular: { value: specularTex ? 1.0 : 0.0 },
+    hasClouds: { value: cloudTex ? 1.0 : 0.0 },
   };
 
   return new THREE.ShaderMaterial({
@@ -206,13 +293,19 @@ function createEarthShaderMaterial(dayTex, nightTex, bumpTex) {
     transparent: false,
     depthWrite: true,
     vertexShader: /* glsl */ `
+      attribute vec4 tangent;
       varying vec2 vUv;
-      varying vec3 vNormal;
+      varying vec3 vWorldNormal;
+      varying vec3 vWorldTangent;
+      varying vec3 vWorldBitangent;
       varying vec3 vWorldPosition;
 
       void main() {
         vUv = uv;
-        vNormal = normalize(normalMatrix * normal);
+        mat3 m = mat3(modelMatrix);
+        vWorldNormal = normalize(m * normal);
+        vWorldTangent = normalize(m * tangent.xyz);
+        vWorldBitangent = normalize(cross(vWorldNormal, vWorldTangent) * tangent.w);
         vec4 worldPos = modelMatrix * vec4(position, 1.0);
         vWorldPosition = worldPos.xyz;
         gl_Position = projectionMatrix * viewMatrix * worldPos;
@@ -221,55 +314,112 @@ function createEarthShaderMaterial(dayTex, nightTex, bumpTex) {
     fragmentShader: /* glsl */ `
       uniform sampler2D dayTexture;
       uniform sampler2D nightTexture;
-      uniform sampler2D bumpTexture;
+      uniform sampler2D normalMap;
+      uniform sampler2D specularMap;
+      uniform sampler2D cloudTexture;
       uniform vec3 sunDirection;
-      uniform float bumpScale;
+      uniform float normalScale;
+      uniform float hasNormal;
+      uniform float hasSpecular;
+      uniform float hasClouds;
 
       varying vec2 vUv;
-      varying vec3 vNormal;
+      varying vec3 vWorldNormal;
+      varying vec3 vWorldTangent;
+      varying vec3 vWorldBitangent;
       varying vec3 vWorldPosition;
 
       void main() {
-        vec3 normal = normalize(vNormal);
+        vec3 sunDir = normalize(sunDirection);
 
-        // Perturb normal with bump map for lighting variation
-        if (bumpScale > 0.0) {
-          float bumpVal = texture2D(bumpTexture, vUv).r;
-          float dx = dFdx(bumpVal) * bumpScale;
-          float dy = dFdy(bumpVal) * bumpScale;
-          normal = normalize(normal + vec3(dx, dy, 0.0));
+        // --- Tangent-space normal mapping (real relief, not dFdx hack) ---
+        vec3 normal = normalize(vWorldNormal);
+        if (hasNormal > 0.5) {
+          vec3 nTex = texture2D(normalMap, vUv).xyz * 2.0 - 1.0;
+          nTex.xy *= normalScale;
+          mat3 TBN = mat3(normalize(vWorldTangent), normalize(vWorldBitangent), normal);
+          normal = normalize(TBN * nTex);
         }
 
-        float NdotL = dot(normal, sunDirection);
+        float NdotL = dot(normal, sunDir);
 
-        // Smooth transition zone between day and night
-        float dayFactor = smoothstep(-0.15, 0.25, NdotL);
+        // --- Sharper (logistic) day/night terminator ---
+        float dayFactor = 1.0 / (1.0 + exp(-16.0 * NdotL));
 
-        vec4 dayColor = texture2D(dayTexture, vUv);
-        vec4 nightColor = texture2D(nightTexture, vUv);
+        vec3 dayColor = texture2D(dayTexture, vUv).rgb;
+        vec3 nightColor = texture2D(nightTexture, vUv).rgb;
 
-        // Boost green channel for vegetation visibility
-        dayColor.g = dayColor.g * 1.15;
-        dayColor.rgb = mix(dayColor.rgb, dayColor.rgb * vec3(0.9, 1.2, 0.85), step(0.3, dayColor.g));
+        // Subtle vegetation boost
+        dayColor.g *= 1.08;
 
-        // Night lights glow stronger in dark areas
-        vec3 nightGlow = nightColor.rgb * 1.6;
+        // Night lights glow in dark areas
+        vec3 nightGlow = nightColor * 1.5;
 
-        vec3 color = mix(nightGlow, dayColor.rgb, dayFactor);
+        vec3 color = mix(nightGlow, dayColor, dayFactor);
 
-        // Add subtle specular highlight for oceans (darker areas in bump map)
-        float specular = pow(max(0.0, dot(reflect(-sunDirection, normal), normalize(-vWorldPosition))), 32.0);
-        float bumpHeight = texture2D(bumpTexture, vUv).r;
-        float oceanMask = 1.0 - smoothstep(0.0, 0.3, bumpHeight);
-        color += vec3(0.3, 0.4, 0.5) * specular * oceanMask * dayFactor * 0.4;
+        // --- Ocean specular gated by the specular (ocean) mask ---
+        if (hasSpecular > 0.5) {
+          float oceanMask = texture2D(specularMap, vUv).r;
+          vec3 viewDir = normalize(cameraPosition - vWorldPosition);
+          vec3 reflectVec = reflect(-sunDir, normal);
+          float specAngle = clamp(dot(reflectVec, viewDir), 0.0, 1.0);
+          float spec = pow(specAngle, 48.0) * oceanMask;
+          color += vec3(1.0, 0.98, 0.9) * spec * dayFactor * 0.9;
+        }
 
-        // Subtle ambient light on the dark side
-        color += dayColor.rgb * 0.015;
+        // --- Cloud self-shadow cast onto the surface (offset toward the sun) ---
+        if (hasClouds > 0.5) {
+          vec2 shadowUV = vUv - 0.0015 * sunDir.xy;
+          float cloudShadow = texture2D(cloudTexture, shadowUV).r;
+          color *= (1.0 - 0.35 * cloudShadow * dayFactor);
+        }
 
-        // 5% transparent Earth
+        // Faint ambient fill so the night side isn't pure black
+        color += dayColor * 0.02;
+
         gl_FragColor = vec4(color, 1.0);
       }
     `,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Cloud layer shader — dims toward the terminator / night side, drifts slowly.
+// ---------------------------------------------------------------------------
+function createCloudShaderMaterial(cloudTex) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      cloudTexture: { value: cloudTex },
+      sunDirection: { value: new THREE.Vector3(1.0, 0.3, 0.5).normalize() },
+      uOpacity: { value: 0.9 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      varying vec3 vWorldNormal;
+      void main() {
+        vUv = uv;
+        vWorldNormal = normalize(mat3(modelMatrix) * normal);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D cloudTexture;
+      uniform vec3 sunDirection;
+      uniform float uOpacity;
+      varying vec2 vUv;
+      varying vec3 vWorldNormal;
+      void main() {
+        vec4 c = texture2D(cloudTexture, vUv);
+        float lum = c.r; // clouds jpg is greyscale — luminance == alpha
+        float NdotL = dot(normalize(vWorldNormal), normalize(sunDirection));
+        float dayFactor = clamp(1.0 / (1.0 + exp(-8.0 * NdotL)), 0.15, 1.0);
+        vec3 rgb = c.rgb * dayFactor;
+        gl_FragColor = vec4(rgb, lum * dayFactor * uOpacity);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.FrontSide,
   });
 }
 
@@ -279,30 +429,36 @@ function createEarthShaderMaterial(dayTex, nightTex, bumpTex) {
 function createAtmosphereMaterial() {
   return new THREE.ShaderMaterial({
     uniforms: {
-      glowColor: { value: new THREE.Color(0x4488ff) },
-      coefficient: { value: 0.6 },
+      glowColor: { value: new THREE.Color(0x5aa0ff) },
       power: { value: 3.5 },
+      sunDirection: { value: new THREE.Vector3(1.0, 0.3, 0.5).normalize() },
     },
     vertexShader: /* glsl */ `
       varying vec3 vNormal;
+      varying vec3 vWorldNormal;
       varying vec3 vPositionView;
       void main() {
         vNormal = normalize(normalMatrix * normal);
+        vWorldNormal = normalize(mat3(modelMatrix) * normal);
         vPositionView = (modelViewMatrix * vec4(position, 1.0)).xyz;
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }
     `,
     fragmentShader: /* glsl */ `
       uniform vec3 glowColor;
-      uniform float coefficient;
       uniform float power;
+      uniform vec3 sunDirection;
       varying vec3 vNormal;
+      varying vec3 vWorldNormal;
       varying vec3 vPositionView;
       void main() {
         vec3 viewDir = normalize(-vPositionView);
-        float fresnel = coefficient + (1.0 - coefficient) * pow(1.0 - abs(dot(vNormal, viewDir)), power);
+        float fresnel = pow(1.0 - abs(dot(vNormal, viewDir)), power);
         fresnel = clamp(fresnel, 0.0, 1.0);
-        gl_FragColor = vec4(glowColor, fresnel * 0.25);
+        // Rim glows blue on the lit side, dims reddish toward the terminator.
+        float sunFacing = 1.0 / (1.0 + exp(-7.0 * (dot(normalize(vWorldNormal), normalize(sunDirection)) + 0.1)));
+        vec3 tint = mix(vec3(0.6, 0.3, 0.15), glowColor, sunFacing);
+        gl_FragColor = vec4(tint, fresnel * 0.6 * (0.25 + 0.75 * sunFacing));
       }
     `,
     side: THREE.BackSide,
@@ -348,7 +504,7 @@ function createTrajectoryMaterial() {
           : mix(midColor, endColor, (t - 0.5) * 2.0);
 
         // Animated dash overlay
-        float dash = sin((vUv.x * dashScale - time * 3.0) * 3.14159) * 0.5 + 0.5;
+        float dash = sin((vUv.x * dashScale - time * 1.2) * 3.14159) * 0.5 + 0.5;
         float alpha = 0.5 + dash * 0.5;
 
         vec3 glow = color * glowIntensity;
@@ -439,15 +595,28 @@ export class LunarScene {
     this.scene = new THREE.Scene();
 
     // ---- Lights ----
-    const ambient = new THREE.AmbientLight(0xffffff, 0.45);
+    // Ambient kept low so the day/night terminator reads (spec §1.7).
+    const ambient = new THREE.AmbientLight(0xffffff, 0.12);
     this.scene.add(ambient);
 
     this.sunLight = new THREE.DirectionalLight(0xfff8e7, 2.0);
     this.sunLight.position.set(100, 30, 50);
     this.scene.add(this.sunLight);
 
-    const hemiLight = new THREE.HemisphereLight(0x4488cc, 0x0a0a2a, 0.1);
+    const hemiLight = new THREE.HemisphereLight(0x4488cc, 0x0a0a2a, 0.08);
     this.scene.add(hemiLight);
+
+    // ---- Instanced LOD state (mid/near 3D glyph tier) ----
+    this._instanced = new Map();      // category -> { mesh, dummy, cap, map: Int32Array }
+    this._lodNear = false;
+    this._lodFrame = 0;
+    this._userHidden = new Set();     // categories toggled off by the user
+
+    // ---- Selective bloom composer ----
+    this._bloom = new SelectiveBloom(
+      this.renderer, this.scene, this.camera,
+      container.clientWidth, container.clientHeight,
+    );
 
     // ---- Build world ----
     this._loadAndBuild();
@@ -457,28 +626,30 @@ export class LunarScene {
   // Async texture loading + scene building
   // =========================================================================
   async _loadAndBuild() {
-    // Load textures from local public folder
-    const [dayTex, nightTex, cloudTex, bumpTex, moonTex, starTex] = await Promise.all([
-      loadTexture('/textures/earth-day.jpg'),
-      loadTexture('/textures/earth-night.jpg'),
-      loadTexture('/textures/earth-clouds.png'),  // may not exist
+    // Load high-res textures (new 8k set, with old low-res files as fallback).
+    const [dayTex, nightTex, cloudTex, bumpTex, normalTex, specTex, moonTex, starTex] = await Promise.all([
+      loadTexture('/textures/8k_earth_daymap.jpg', '/textures/earth-day.jpg'),
+      loadTexture('/textures/8k_earth_nightmap.jpg', '/textures/earth-night.jpg'),
+      loadTexture('/textures/8k_earth_clouds.jpg', '/textures/earth-clouds.png'),
       loadTexture('/textures/earth-bump.png'),
-      loadTexture('/textures/moon.jpg'),           // may not exist — procedural fallback
-      loadTexture('/textures/starfield.png'),
+      loadTexture('/textures/earth-normal.jpg'),
+      loadTexture('/textures/earth-specular.jpg'),
+      loadTexture('/textures/8k_moon.jpg', '/textures/moon.jpg'),
+      loadTexture('/textures/8k_stars_milky_way.jpg', '/textures/starfield.png'),
     ]);
 
     if (this._disposed) return;
 
-    // Set texture properties
-    for (const tex of [dayTex, nightTex, cloudTex, bumpTex, moonTex, starTex]) {
-      if (tex) {
-        tex.colorSpace = THREE.SRGBColorSpace;
-        this._disposables.push(tex);
-      }
+    // Color textures are sRGB; data maps (normal/specular/bump) are linear.
+    for (const tex of [dayTex, nightTex, cloudTex, moonTex, starTex]) {
+      if (tex) { tex.colorSpace = THREE.SRGBColorSpace; this._disposables.push(tex); }
+    }
+    for (const tex of [bumpTex, normalTex, specTex]) {
+      if (tex) { tex.colorSpace = THREE.NoColorSpace; this._disposables.push(tex); }
     }
 
     this._createStarfield(starTex);
-    this._createEarth(dayTex, nightTex, cloudTex, bumpTex);
+    this._createEarth(dayTex, nightTex, cloudTex, bumpTex, normalTex, specTex);
     this._createMoon(moonTex);
     // (Synthetic debris cloud removed — the real Space-Track catalog now includes
     // ~10k tracked debris objects rendered with real SGP4 positions.)
@@ -549,8 +720,10 @@ export class LunarScene {
   // =========================================================================
   // Earth — fully opaque, no transparency, vegetation boost
   // =========================================================================
-  _createEarth(dayTex, nightTex, cloudTex, bumpTex) {
+  _createEarth(dayTex, nightTex, cloudTex, bumpTex, normalTex, specTex) {
     const earthGeo = new THREE.SphereGeometry(EARTH_RADIUS, EARTH_SEGMENTS, EARTH_SEGMENTS);
+    // Real tangent-space normal mapping requires per-vertex tangents.
+    earthGeo.computeTangents();
     this._disposables.push(earthGeo);
 
     // Earth pivot for axial tilt
@@ -560,7 +733,7 @@ export class LunarScene {
 
     if (dayTex && nightTex) {
       // Custom day/night shader — fully opaque, depthWrite on
-      this._earthMaterial = createEarthShaderMaterial(dayTex, nightTex, bumpTex);
+      this._earthMaterial = createEarthShaderMaterial(dayTex, nightTex, normalTex, specTex, cloudTex);
       this.earth = new THREE.Mesh(earthGeo, this._earthMaterial);
     } else {
       // Fallback: standard material with 5% transparency
@@ -580,25 +753,20 @@ export class LunarScene {
     this.earthPivot.add(this.earth);
     this._disposables.push(this._earthMaterial);
 
-    // Cloud layer (separate sphere OUTSIDE Earth, opacity 0.55)
+    // Cloud layer — separate sphere slightly above the surface, custom shader
+    // that dims toward the terminator and drifts slowly (animate()).
     if (cloudTex) {
-      const cloudGeo = new THREE.SphereGeometry(EARTH_RADIUS * 1.005, EARTH_SEGMENTS, EARTH_SEGMENTS);
-      const cloudMat = new THREE.MeshStandardMaterial({
-        map: cloudTex,
-        alphaMap: cloudTex,
-        transparent: true,
-        opacity: 0.55,
-        depthWrite: false,
-        side: THREE.DoubleSide,
-      });
-      this.clouds = new THREE.Mesh(cloudGeo, cloudMat);
+      const cloudGeo = new THREE.SphereGeometry(EARTH_RADIUS * 1.006, EARTH_SEGMENTS, EARTH_SEGMENTS);
+      this._cloudMaterial = createCloudShaderMaterial(cloudTex);
+      this.clouds = new THREE.Mesh(cloudGeo, this._cloudMaterial);
       this.earthPivot.add(this.clouds);
-      this._disposables.push(cloudGeo, cloudMat);
+      this._disposables.push(cloudGeo, this._cloudMaterial);
     }
 
     // Atmosphere inner glow — SEPARATE mesh, BackSide, NormalBlending, low opacity
     const atmosGeo = new THREE.SphereGeometry(EARTH_RADIUS * 1.015, 64, 64);
     const atmosMat = createAtmosphereMaterial();
+    this._atmosphereMaterial = atmosMat;
     this.atmosphere = new THREE.Mesh(atmosGeo, atmosMat);
     this.atmosphere.renderOrder = -1;
     this.scene.add(this.atmosphere);
@@ -649,14 +817,20 @@ export class LunarScene {
   // Moon — texture or procedural grey with crater marks
   // =========================================================================
   _createMoon(moonTex) {
-    const moonGeo = new THREE.SphereGeometry(MOON_RADIUS, 64, 64);
+    const moonGeo = new THREE.SphereGeometry(MOON_RADIUS, 128, 128);
     this._disposables.push(moonGeo);
 
     if (moonTex) {
+      // 8k color + bump/normal relief derived from the same luminance texture.
+      // NASA ships no lunar normal map; luminance-driven bump is the standard
+      // derived proxy and gives clear crater relief under the shared sun light.
+      const normalTex = this._deriveMoonNormalMap(moonTex);
       const moonMat = new THREE.MeshStandardMaterial({
         map: moonTex,
         bumpMap: moonTex,
-        bumpScale: 0.015,
+        bumpScale: 0.004,
+        normalMap: normalTex || undefined,
+        normalScale: normalTex ? new THREE.Vector2(0.7, 0.7) : undefined,
         roughness: 0.95,
         metalness: 0.0,
       });
@@ -677,6 +851,59 @@ export class LunarScene {
     
     // Moon orbital path - bright yellow dashed ring
     this._createMoonOrbitPath();
+  }
+
+  /**
+   * Derive a tangent-space normal map from the Moon's color luminance via a
+   * Sobel height gradient. Downsampled so it's cheap to compute once at load.
+   * @param {THREE.Texture} colorTex
+   * @returns {THREE.CanvasTexture|null}
+   */
+  _deriveMoonNormalMap(colorTex) {
+    const img = colorTex && colorTex.image;
+    if (!img || !img.width || !img.height) return null;
+    try {
+      const W = 1024, H = 512;
+      const src = document.createElement('canvas');
+      src.width = W; src.height = H;
+      const sctx = src.getContext('2d', { willReadFrequently: true });
+      sctx.drawImage(img, 0, 0, W, H);
+      const data = sctx.getImageData(0, 0, W, H).data;
+
+      // Luminance heightfield
+      const height = new Float32Array(W * H);
+      for (let i = 0; i < W * H; i++) {
+        height[i] = (data[i * 4] * 0.299 + data[i * 4 + 1] * 0.587 + data[i * 4 + 2] * 0.114) / 255;
+      }
+
+      const out = document.createElement('canvas');
+      out.width = W; out.height = H;
+      const octx = out.getContext('2d');
+      const outImg = octx.createImageData(W, H);
+      const od = outImg.data;
+      const strength = 2.5;
+      const at = (x, y) => height[((y + H) % H) * W + ((x + W) % W)];
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const dx = (at(x - 1, y) - at(x + 1, y)) * strength;
+          const dy = (at(x, y - 1) - at(x, y + 1)) * strength;
+          const len = Math.hypot(dx, dy, 1.0);
+          const idx = (y * W + x) * 4;
+          od[idx] = ((dx / len) * 0.5 + 0.5) * 255;
+          od[idx + 1] = ((dy / len) * 0.5 + 0.5) * 255;
+          od[idx + 2] = (1.0 / len) * 0.5 * 255 + 127.5;
+          od[idx + 3] = 255;
+        }
+      }
+      octx.putImageData(outImg, 0, 0);
+      const tex = new THREE.CanvasTexture(out);
+      tex.colorSpace = THREE.NoColorSpace;
+      tex.needsUpdate = true;
+      this._disposables.push(tex);
+      return tex;
+    } catch {
+      return null; // e.g. canvas tainted — fall back to bumpMap only
+    }
   }
 
   _createMoonOrbitPath() {
@@ -907,10 +1134,107 @@ export class LunarScene {
 
       this._disposables.push(geometry, material);
 
+      // Build the 3D instanced glyph tier for this category (hidden until the
+      // camera zooms into LOD_NEAR_DIST).
+      this._buildInstancedLOD(category, items);
+
       // ISS orbit path: draw a thin dashed ring at ISS orbital altitude
       if (category === 'iss' && items.length > 0) {
         this._createISSOrbitPath(items[0]);
       }
+    }
+  }
+
+  /**
+   * Build the instanced 3D-glyph LOD tier for a category. Capacity is capped;
+   * the mesh stays hidden and empty (count = 0) until the camera zooms in.
+   * @param {string} category
+   * @param {Array} items
+   */
+  _buildInstancedLOD(category, items) {
+    const shape = glyphShapeFor(category);
+    const geo = buildGlyphGeometry(shape);
+    const colorHex = getCategoryColorHex(category);
+    const mat = new THREE.MeshStandardMaterial({
+      color: colorHex,
+      emissive: new THREE.Color(colorHex).multiplyScalar(0.18),
+      roughness: 0.55,
+      metalness: 0.45,
+      flatShading: true,
+    });
+    const cap = Math.min(items.length, LOD_MAX_PER_CATEGORY);
+    const mesh = new THREE.InstancedMesh(geo, mat, cap);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.count = 0;
+    mesh.visible = false;
+    mesh.frustumCulled = false; // we manage the visible subset ourselves
+    mesh.renderOrder = 2;
+    this.scene.add(mesh);
+    this._disposables.push(geo, mat);
+    this._instanced.set(category, {
+      mesh,
+      dummy: new THREE.Object3D(),
+      cap,
+      map: new Int32Array(cap), // instanceId -> local index in this category
+    });
+  }
+
+  /**
+   * LOD driver — swap between the flat Points billboards (far) and the 3D
+   * instanced glyphs (near) based on camera distance to Earth centre, and
+   * refresh the visible instanced subset periodically.
+   */
+  _updateLOD() {
+    if (this._instanced.size === 0) return;
+    const camDist = this.camera.position.length();
+    const near = camDist < LOD_NEAR_DIST;
+
+    if (near !== this._lodNear) {
+      this._lodNear = near;
+      for (const [cat, points] of this._orbitalMeshes) {
+        const hidden = this._userHidden.has(cat);
+        points.visible = !near && !hidden;
+        const inst = this._instanced.get(cat);
+        if (inst) inst.mesh.visible = near && !hidden;
+      }
+      if (near) this._rebuildInstances();
+      return;
+    }
+
+    if (near) {
+      this._lodFrame = (this._lodFrame + 1) % LOD_REBUILD_INTERVAL;
+      if (this._lodFrame === 0) this._rebuildInstances();
+    }
+  }
+
+  /** Populate instanced matrices with objects within LOD_INSTANCE_CUTOFF of the camera. */
+  _rebuildInstances() {
+    const cam = this.camera.position;
+    const cutoffSq = LOD_INSTANCE_CUTOFF * LOD_INSTANCE_CUTOFF;
+    for (const [category, points] of this._orbitalMeshes) {
+      const inst = this._instanced.get(category);
+      if (!inst) continue;
+      if (this._userHidden.has(category)) { inst.mesh.count = 0; continue; }
+
+      const items = this._orbitalCategoryItems.get(category);
+      const posAttr = points.geometry.getAttribute('position');
+      const arr = posAttr.array;
+      const { mesh, dummy, cap, map } = inst;
+      let n = 0;
+      for (let i = 0; i < items.length && n < cap; i++) {
+        const x = arr[i * 3], y = arr[i * 3 + 1], z = arr[i * 3 + 2];
+        const dx = x - cam.x, dy = y - cam.y, dz = z - cam.z;
+        if (dx * dx + dy * dy + dz * dz > cutoffSq) continue;
+        dummy.position.set(x, y, z);
+        dummy.scale.setScalar(rcsScale(items[i].rcs));
+        dummy.lookAt(0, 0, 0); // nadir-ish orientation cue
+        dummy.updateMatrix();
+        mesh.setMatrixAt(n, dummy.matrix);
+        map[n] = i;
+        n++;
+      }
+      mesh.count = n;
+      mesh.instanceMatrix.needsUpdate = true;
     }
   }
 
@@ -1039,6 +1363,30 @@ export class LunarScene {
     if (!this._raycaster) this._raycaster = new THREE.Raycaster();
     this._raycaster.params.Points.threshold = 0.025;
     this._raycaster.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
+
+    // Near LOD: pick against the 3D instanced glyphs (Points are hidden).
+    if (this._lodNear) {
+      let best = null;
+      for (const [cat, inst] of this._instanced) {
+        if (!inst.mesh.visible || inst.mesh.count === 0) continue;
+        const hits = this._raycaster.intersectObject(inst.mesh);
+        for (const h of hits) {
+          if (h.instanceId == null) continue;
+          if (!best || h.distance < best.distance) {
+            const localIndex = inst.map[h.instanceId];
+            best = { category: cat, index: localIndex, distance: h.distance, point: h.point };
+          }
+        }
+      }
+      if (best) {
+        const gidxArr = this._orbitalCategoryGidx.get(best.category);
+        const gidx = gidxArr ? gidxArr[best.index] : -1;
+        return { gidx, category: best.category, index: best.index, point: best.point };
+      }
+      return null;
+    }
+
+    // Far LOD: pick against the Points billboards.
     let best = null;
     for (const [cat, pts] of this._orbitalMeshes) {
       if (!pts.visible) continue;
@@ -1090,12 +1438,18 @@ export class LunarScene {
    * @param {boolean} visible
    */
   setCategoryVisibility(category, visible) {
-    const mesh = this._orbitalMeshes.get(category);
-    if (mesh) mesh.visible = visible;
-    // Handle variant keys
     const altKey = category.includes('_') ? category.replace('_', ' ') : category.replace(' ', '_');
-    const altMesh = this._orbitalMeshes.get(altKey);
-    if (altMesh) altMesh.visible = visible;
+    for (const key of [category, altKey]) {
+      // Track user intent so the LOD driver doesn't re-show a hidden category.
+      if (visible) this._userHidden.delete(key);
+      else this._userHidden.add(key);
+
+      const mesh = this._orbitalMeshes.get(key);
+      // Points visible only in far mode; instanced glyphs only in near mode.
+      if (mesh) mesh.visible = visible && !this._lodNear;
+      const inst = this._instanced.get(key);
+      if (inst) inst.mesh.visible = visible && this._lodNear;
+    }
   }
 
   // =========================================================================
@@ -1120,24 +1474,21 @@ export class LunarScene {
 
     const points = trajectoryPoints.map((p) => new THREE.Vector3(p.x, p.y, p.z));
 
-    // Extend trajectory to Moon if the last point is far from Moon position
-    const moonPos = this.moon
-      ? this.moon.position.clone()
-      : new THREE.Vector3(MOON_DISTANCE, 0, 0);
-    const lastPoint = points[points.length - 1];
-    const distToMoon = lastPoint.distanceTo(moonPos);
-
-    // If last point is more than 2 Moon-radii away from Moon center, extend
-    if (distToMoon > MOON_RADIUS * 2) {
-      // Add interpolated points from last waypoint toward Moon surface
-      const moonSurface = moonPos.clone().add(
-        lastPoint.clone().sub(moonPos).normalize().multiplyScalar(MOON_RADIUS)
-      );
-      const extensionSteps = 20;
-      for (let i = 1; i <= extensionSteps; i++) {
-        const t = i / extensionSteps;
-        const interp = new THREE.Vector3().lerpVectors(lastPoint, moonSurface, t);
-        points.push(interp);
+    // NOTE: no straight-line extension to the Moon. The physics descent waypoints
+    // already terminate on the lunar surface at the arrival-time Moon position, and
+    // the Moon mesh is moved to that same position (see main.js setMoonPosition).
+    // Only close a genuinely tiny gap (< 1 Moon radius) if the Moon is present and
+    // the final waypoint is already adjacent to its surface.
+    if (this.moon) {
+      const moonPos = this.moon.position;
+      const lastPoint = points[points.length - 1];
+      const distToMoon = lastPoint.distanceTo(moonPos);
+      const gap = Math.abs(distToMoon - MOON_RADIUS);
+      if (distToMoon > MOON_RADIUS && gap > 1e-4 && gap < MOON_RADIUS) {
+        const moonSurface = moonPos.clone().add(
+          lastPoint.clone().sub(moonPos).normalize().multiplyScalar(MOON_RADIUS)
+        );
+        points.push(moonSurface);
       }
     }
 
@@ -1157,16 +1508,39 @@ export class LunarScene {
     this._trajectoryGroup.add(tubeMesh);
     this._disposables.push(tubeGeo);
 
-    // Outer glow tube
-    const glowGeo = new THREE.TubeGeometry(curve, Math.floor(tubularSegments / 2), tubeRadius * 2.5, 6, false);
-    const glowMat = new THREE.MeshBasicMaterial({
-      color,
+    // Outer glow tube — additive fake-glow shader with radial falloff, fed into
+    // the bloom layer so it reads as an energetic, live trajectory (spec §6).
+    const glowGeo = new THREE.TubeGeometry(curve, Math.floor(tubularSegments / 2), tubeRadius * 3.0, 8, false);
+    const glowMat = new THREE.ShaderMaterial({
+      uniforms: {
+        glowColor: { value: new THREE.Color(color) },
+        falloff: { value: 0.18 },
+        glowSharpness: { value: 0.6 },
+      },
+      vertexShader: /* glsl */ `
+        varying vec3 vNormalView;
+        void main() {
+          vNormalView = normalize(normalMatrix * normal);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform vec3 glowColor;
+        uniform float falloff;
+        uniform float glowSharpness;
+        varying vec3 vNormalView;
+        void main() {
+          float intensity = pow(1.0 - abs(vNormalView.z), 2.0 - glowSharpness);
+          gl_FragColor = vec4(glowColor, intensity * falloff * 3.0);
+        }
+      `,
       transparent: true,
-      opacity: 0.1,
       depthWrite: false,
       side: THREE.BackSide,
+      blending: THREE.AdditiveBlending,
     });
     const glowMesh = new THREE.Mesh(glowGeo, glowMat);
+    glowMesh.layers.enable(BLOOM_LAYER);
     this._trajectoryGroup.add(glowMesh);
     this._disposables.push(glowGeo, glowMat);
 
@@ -1210,20 +1584,33 @@ export class LunarScene {
     group.name = 'conjunctionMarkers';
     for (const m of markers) {
       const color = m.critical ? 0xff2222 : 0xffaa00;
+      const emissive = m.critical ? 0xff0000 : 0xff7700;
       const geo = new THREE.SphereGeometry(0.02, 12, 12);
-      const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 });
+      // Hot emissive + toneMapped:false so the bloom pass sees a blown-out
+      // pixel; on BLOOM_LAYER so the selective composer makes it glow.
+      const mat = new THREE.MeshStandardMaterial({
+        color,
+        emissive,
+        emissiveIntensity: 3.0,
+        toneMapped: false,
+      });
       const dot = new THREE.Mesh(geo, mat);
       dot.position.set(m.pos.x, m.pos.y, m.pos.z);
       dot.userData._isPulse = true;
+      dot.layers.enable(BLOOM_LAYER);
       group.add(dot);
       this._disposables.push(geo, mat);
       // ring
       const rgeo = new THREE.RingGeometry(0.03, 0.045, 20);
-      const rmat = new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, transparent: true, opacity: 0.6 });
+      const rmat = new THREE.MeshStandardMaterial({
+        color, emissive, emissiveIntensity: 2.0, toneMapped: false,
+        side: THREE.DoubleSide, transparent: true, opacity: 0.85,
+      });
       const ring = new THREE.Mesh(rgeo, rmat);
       ring.position.copy(dot.position);
       ring.lookAt(this.camera.position);
       ring.userData._isPulse = true;
+      ring.layers.enable(BLOOM_LAYER);
       group.add(ring);
       this._disposables.push(rgeo, rmat);
       if (m.label) {
@@ -1466,67 +1853,71 @@ export class LunarScene {
     this._rocket = new THREE.Group();
     this._rocket.name = 'rocket';
 
-    // Nose cone
-    const noseGeo = new THREE.ConeGeometry(r, h * 0.2, 8);
+    // --- Multi-stage tapered body (Saturn-V-ish proportions, spec §7) ---
+    const stageMat = new THREE.MeshStandardMaterial({
+      color: 0xf2f2f2, roughness: 0.45, metalness: 0.55,
+      emissive: 0x222222, emissiveIntensity: 0.15,
+    });
+    const ringMat = new THREE.MeshStandardMaterial({
+      color: 0x3a3a3a, roughness: 0.7, metalness: 0.6,
+    });
+    this._disposables.push(stageMat, ringMat);
+
+    // Cursor starts at the base and stacks upward. y=0 stays near mid-body.
+    let y = -0.42 * h;
+    const addStage = (rBottom, rTop, hFrac) => {
+      const geo = new THREE.CylinderGeometry(rTop, rBottom, hFrac, 16);
+      const mesh = new THREE.Mesh(geo, stageMat);
+      mesh.position.y = y + hFrac / 2;
+      this._rocket.add(mesh);
+      this._disposables.push(geo);
+      y += hFrac;
+      return rTop;
+    };
+    const addRing = (rad, hFrac) => {
+      const geo = new THREE.CylinderGeometry(rad * 1.04, rad * 1.04, hFrac, 16);
+      const mesh = new THREE.Mesh(geo, ringMat);
+      mesh.position.y = y + hFrac / 2;
+      this._rocket.add(mesh);
+      this._disposables.push(geo);
+      y += hFrac;
+    };
+
+    const baseY = y; // remember for fins / nozzle
+    addStage(r, r, h * 0.30);          // S-IC (stage 1, widest)
+    addRing(r, h * 0.015);             // interstage
+    addStage(r, r, h * 0.22);          // S-II (stage 2)
+    addRing(r * 0.85, h * 0.015);      // interstage
+    addStage(r * 0.68, r * 0.62, h * 0.16); // S-IVB (stage 3, narrower)
+    addRing(r * 0.5, h * 0.012);       // interstage
+    addStage(r * 0.5, r * 0.34, h * 0.12);  // IU + CSM stack (taper)
+
+    // Nose cone / launch escape tip
+    const noseGeo = new THREE.ConeGeometry(r * 0.34, h * 0.16, 16);
     const noseMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      emissive: 0xffffff,
-      emissiveIntensity: 0.3,
-      roughness: 0.2,
-      metalness: 0.6,
+      color: 0xffffff, emissive: 0x333333, emissiveIntensity: 0.25,
+      roughness: 0.25, metalness: 0.6,
     });
     const nose = new THREE.Mesh(noseGeo, noseMat);
-    nose.position.y = h * 0.5;
+    nose.position.y = y + h * 0.08;
     this._rocket.add(nose);
     this._disposables.push(noseGeo, noseMat);
 
-    // Body
-    const bodyGeo = new THREE.CylinderGeometry(r, r, h * 0.55, 8);
-    const bodyMat = new THREE.MeshStandardMaterial({
-      color: 0xf0f0f0,
-      emissive: 0xf0f0f0,
-      emissiveIntensity: 0.2,
-      roughness: 0.3,
-      metalness: 0.4,
-    });
-    const body = new THREE.Mesh(bodyGeo, bodyMat);
-    body.position.y = h * 0.125;
-    this._rocket.add(body);
-    this._disposables.push(bodyGeo, bodyMat);
-
-    // Color band
-    const bandGeo = new THREE.CylinderGeometry(r * 1.02, r * 1.02, h * 0.06, 8);
-    const bandMat = new THREE.MeshStandardMaterial({
-      color: 0x1a73e8,
-      emissive: 0x1a73e8,
-      emissiveIntensity: 0.5,
-    });
-    const band = new THREE.Mesh(bandGeo, bandMat);
-    band.position.y = h * 0.2;
-    this._rocket.add(band);
-    this._disposables.push(bandGeo, bandMat);
-
-    // Engine nozzle (inverted cone)
-    const nozzleGeo = new THREE.ConeGeometry(r * 0.8, h * 0.12, 8);
+    // Engine nozzle (inverted cone) at the base
+    const nozzleGeo = new THREE.ConeGeometry(r * 0.8, h * 0.1, 12);
     const nozzleMat = new THREE.MeshStandardMaterial({
-      color: 0x333333,
-      roughness: 0.8,
-      metalness: 0.7,
+      color: 0x2a2a2a, roughness: 0.8, metalness: 0.7,
     });
     const nozzle = new THREE.Mesh(nozzleGeo, nozzleMat);
     nozzle.rotation.x = Math.PI; // inverted
-    nozzle.position.y = -h * 0.32;
+    nozzle.position.y = baseY - h * 0.04;
     this._rocket.add(nozzle);
     this._disposables.push(nozzleGeo, nozzleMat);
 
-    // 4 fins
-    const finGeo = new THREE.BoxGeometry(r * 0.15, h * 0.15, r * 2.5);
+    // 4 fins at the base of the widest stage
+    const finGeo = new THREE.BoxGeometry(r * 0.15, h * 0.16, r * 2.6);
     const finMat = new THREE.MeshStandardMaterial({
-      color: 0xeeeeee,
-      emissive: 0xeeeeee,
-      emissiveIntensity: 0.15,
-      roughness: 0.3,
-      metalness: 0.3,
+      color: 0xdddddd, roughness: 0.35, metalness: 0.4,
     });
     this._disposables.push(finGeo, finMat);
     for (let i = 0; i < 4; i++) {
@@ -1534,7 +1925,7 @@ export class LunarScene {
       const angle = (i / 4) * TWO_PI;
       fin.position.set(
         Math.cos(angle) * r * 0.8,
-        -h * 0.28,
+        baseY + h * 0.06,
         Math.sin(angle) * r * 0.8,
       );
       fin.rotation.y = angle;
@@ -1836,24 +2227,27 @@ export class LunarScene {
 
     this._animationId = requestAnimationFrame(() => this.animate());
 
-    const delta = this.clock.getDelta();
+    // Clamp delta so a backgrounded-tab resume doesn't teleport damped values.
+    const delta = Math.min(this.clock.getDelta(), 0.1);
     const elapsed = this.clock.getElapsedTime();
+    const frameScale = delta * 60; // normalize per-frame magic constants to 60fps
 
     // Controls
     this.controls.update();
 
-    // Earth rotation
-    if (this.earth) {
-      this.earth.rotation.y += EARTH_ROTATION_SPEED;
+    // Earth rotation — cosmetic spin, paused while a trajectory is displayed so the
+    // inertial ECI frame (frozen at launchDate) stays aligned with the beacon.
+    if (this.earth && !this._freezeEarthRotation) {
+      this.earth.rotation.y += EARTH_ROTATION_SPEED * frameScale;
     }
 
-    // Cloud rotation (slightly different speed)
+    // Cloud rotation (slightly different speed) — slow drift
     if (this.clouds) {
-      this.clouds.rotation.y += CLOUD_ROTATION_SPEED;
+      this.clouds.rotation.y += CLOUD_ROTATION_SPEED * frameScale;
     }
 
     // Moon orbit (simple circular for default; overridden by external moonPosition)
-    this._moonOrbitAngle += MOON_ORBIT_SPEED;
+    this._moonOrbitAngle += MOON_ORBIT_SPEED * frameScale;
     if (this.moon && !this._externalMoonPos) {
       this.moon.position.set(
         Math.cos(this._moonOrbitAngle) * MOON_DISTANCE,
@@ -1862,10 +2256,20 @@ export class LunarScene {
       );
     }
 
-    // Update sun direction on earth shader to match sunLight
+    // Update sun direction on earth / cloud / atmosphere shaders to match sunLight
+    const sunDir = this.sunLight.position;
     if (this._earthMaterial && this._earthMaterial.uniforms && this._earthMaterial.uniforms.sunDirection) {
-      this._earthMaterial.uniforms.sunDirection.value.copy(this.sunLight.position).normalize();
+      this._earthMaterial.uniforms.sunDirection.value.copy(sunDir).normalize();
     }
+    if (this._cloudMaterial && this._cloudMaterial.uniforms) {
+      this._cloudMaterial.uniforms.sunDirection.value.copy(sunDir).normalize();
+    }
+    if (this._atmosphereMaterial && this._atmosphereMaterial.uniforms) {
+      this._atmosphereMaterial.uniforms.sunDirection.value.copy(sunDir).normalize();
+    }
+
+    // LOD: switch Points <-> instanced 3D glyphs by camera distance.
+    this._updateLOD();
 
     // Orbital object positions are updated from the propagation worker (see main.js),
     // not re-propagated on the render thread.
@@ -1935,13 +2339,17 @@ export class LunarScene {
     // Camera follow: keep the orbit target on the rocket / Moon core so the user
     // orbits around it (Earth view targets the origin, handled by focusEarth).
     if (this._followRocket && this._rocket && this._rocket.visible) {
-      this.controls.target.lerp(this._rocket.position, 0.12);
+      dampVec3(this.controls.target, this._rocket.position, 6.0, delta);
     } else if (this._followMoon && this.moon) {
-      this.controls.target.lerp(this.moon.position, 0.12);
+      dampVec3(this.controls.target, this.moon.position, 6.0, delta);
     }
 
-    // Render
-    this.renderer.render(this.scene, this.camera);
+    // Render — selective-bloom composer (falls back to direct render).
+    if (this._bloom) {
+      this._bloom.render();
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
   }
 
   // =========================================================================
@@ -1958,6 +2366,28 @@ export class LunarScene {
   }
 
   // =========================================================================
+  // Earth rotation freeze (align inertial ECI frame with launchDate)
+  // =========================================================================
+  /**
+   * Freeze the cosmetic Earth spin and set its rotation so the surface texture
+   * aligns with the ECI frame at the given GMST. The launch beacon is rendered
+   * from the true ECI launch point, so the Earth must be rotated by GMST for the
+   * beacon to sit over the correct geography.
+   * @param {number} gmstRad  Greenwich Mean Sidereal Time in radians.
+   */
+  freezeEarthRotationAt(gmstRad) {
+    this._freezeEarthRotation = true;
+    if (this.earth) {
+      this.earth.rotation.y = gmstRad;
+    }
+  }
+
+  /** Resume the cosmetic Earth spin (e.g. when the trajectory is cleared). */
+  resumeEarthRotation() {
+    this._freezeEarthRotation = false;
+  }
+
+  // =========================================================================
   // Resize
   // =========================================================================
   onResize() {
@@ -1966,6 +2396,7 @@ export class LunarScene {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+    if (this._bloom) this._bloom.setSize(w, h);
   }
 
   // =========================================================================
@@ -2043,6 +2474,18 @@ export class LunarScene {
       this._rocket = null;
       this._rocketExhaust = null;
     }
+
+    // Dispose bloom composer
+    if (this._bloom) { this._bloom.dispose(); this._bloom = null; }
+
+    // Remove instanced LOD meshes
+    for (const inst of this._instanced.values()) {
+      this.scene.remove(inst.mesh);
+      if (inst.mesh.geometry) inst.mesh.geometry.dispose();
+      if (inst.mesh.material) inst.mesh.material.dispose();
+      inst.mesh.dispose();
+    }
+    this._instanced.clear();
 
     // Remove orbital Points meshes
     for (const points of this._orbitalMeshes.values()) {

@@ -1,296 +1,544 @@
+/* =============================================================================
+   LUNAR LAUNCHER — UI chrome design system
+   ---------------------------------------------------------------------------
+   Scope note: the app's DOM + base layout rules are generated at runtime by
+   src/main.js (injectStyles()), which appends its own <style> tag to <head>
+   *after* this stylesheet loads. That means any selector here needs to match
+   or exceed that injected stylesheet's specificity to win the cascade — every
+   rule below is intentionally scoped under the stable `#app` root id so it
+   reliably overrides main.js's class-only selectors regardless of injection
+   order. Nothing here touches position/top/left/right/width/height/z-index/
+   display/flex/grid structure — those are load-bearing layout values owned by
+   main.js. This file only adds surface: color, depth (shadow), radius,
+   type, and motion.
+   ========================================================================= */
+
 :root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+  color-scheme: dark;
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
+  /* ---- Surface & depth (dual-shadow neomorphic recipe, tuned for near-black) --- */
+  --void: #050608;
+  --surface-1: #14161f;
+  --surface-2: #0d0e14;
+  --well: #0a0b10;
+  --well-2: #101219;
+  --hairline: rgba(255, 255, 255, 0.07);
+  --hairline-strong: rgba(255, 255, 255, 0.16);
+  --shadow-dark: rgba(0, 0, 0, 0.6);
+  --shadow-dark-soft: rgba(0, 0, 0, 0.4);
+  --shadow-light: rgba(255, 255, 255, 0.045);
 
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  /* ---- Brand accent — reuses the app's existing mission-blue, not a new hue --- */
+  --accent: #1a73e8;
+  --accent-bright: #4da3ff;
+  --accent-soft: rgba(26, 115, 232, 0.16);
+  --accent-glow: rgba(26, 115, 232, 0.45);
 
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
+  /* ---- Status (shared with 3D conjunction markers) ---- */
+  --success: #00e08a;
+  --warning: #ffcc44;
+  --danger: #ff5d5d;
+
+  /* ---- Type ---- */
+  --text-primary: #f0f3f8;
+  --text-secondary: #9aa7b8;
+  --text-tertiary: #66738a;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'Consolas', 'SFMono-Regular', 'Liberation Mono', Menlo, monospace;
+
+  /* ---- Radius / rhythm ---- */
+  --r-lg: 18px;
+  --r-md: 12px;
+  --r-sm: 8px;
+  --r-xs: 6px;
+  --r-pill: 999px;
+
+  /* ---- Motion ---- */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast: 0.15s;
+  --dur-med: 0.25s;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
-
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
-}
-
-body {
-  margin: 0;
-}
-
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
-}
-
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
-  }
-}
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
-  }
-}
-p {
-  margin: 0;
-}
-
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
-}
-
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
-}
-
-.counter {
-  font-size: 16px;
-  padding: 5px 10px;
-  border-radius: 5px;
-  color: var(--accent);
-  background: var(--accent-bg);
-  border: 2px solid transparent;
-  transition: border-color 0.3s;
-  margin-bottom: 24px;
-
-  &:hover {
-    border-color: var(--accent-border);
-  }
-  &:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-}
-
-.hero {
-  position: relative;
-
-  .base,
-  .framework,
-  .vite {
-    inset-inline: 0;
-    margin: 0 auto;
-  }
-
-  .base {
-    width: 170px;
-    position: relative;
-    z-index: 0;
-  }
-
-  .framework,
-  .vite {
-    position: absolute;
-  }
-
-  .framework {
-    z-index: 1;
-    top: 34px;
-    height: 28px;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
-      scale(1.4);
-  }
-
-  .vite {
-    z-index: 0;
-    top: 107px;
-    height: 26px;
-    width: auto;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
-      scale(0.8);
-  }
-}
+/* =============================================================================
+   Type foundation — establishes a real two-family system (UI sans + tabular
+   mono for telemetry/readouts) so the dashboard doesn't read as single-font.
+   ========================================================================= */
 
 #app {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
-#center {
-  display: flex;
-  flex-direction: column;
-  gap: 25px;
-  place-content: center;
-  place-items: center;
-  flex-grow: 1;
-
-  @media (max-width: 1024px) {
-    padding: 32px 20px 24px;
-    gap: 18px;
-  }
+#app .utc-clock,
+#app .window-card-date,
+#app .window-card-stats,
+#app .info-panel-objects,
+#app .info-panel-clock,
+#app .phase-status {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
-#next-steps {
-  display: flex;
-  border-top: 1px solid var(--border);
-  text-align: left;
+/* =============================================================================
+   Scrollbars
+   ========================================================================= */
 
-  & > div {
-    flex: 1 1 0;
-    padding: 32px;
-    @media (max-width: 1024px) {
-      padding: 24px 20px;
-    }
-  }
-
-  .icon {
-    margin-bottom: 16px;
-    width: 22px;
-    height: 22px;
-  }
-
-  @media (max-width: 1024px) {
-    flex-direction: column;
-    text-align: center;
-  }
+#app *::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(77, 163, 255, 0.4), rgba(255, 255, 255, 0.1));
+  border-radius: var(--r-pill);
 }
 
-#docs {
-  border-right: 1px solid var(--border);
+/* =============================================================================
+   Panel bases — top bar / sidebars (edge-pinned, hybrid glass + neomorphic)
+   ========================================================================= */
 
-  @media (max-width: 1024px) {
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-  }
+#app .top-bar {
+  background: linear-gradient(180deg, #14161f 0%, #0d0e14 100%);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border-bottom: 1px solid var(--hairline);
+  box-shadow: 0 8px 24px var(--shadow-dark-soft);
 }
 
-#next-steps ul {
-  list-style: none;
-  padding: 0;
-  display: flex;
-  gap: 8px;
-  margin: 32px 0 0;
-
-  .logo {
-    height: 18px;
-  }
-
-  a {
-    color: var(--text-h);
-    font-size: 16px;
-    border-radius: 6px;
-    background: var(--social-bg);
-    display: flex;
-    padding: 6px 12px;
-    align-items: center;
-    gap: 8px;
-    text-decoration: none;
-    transition: box-shadow 0.3s;
-
-    &:hover {
-      box-shadow: var(--shadow);
-    }
-    .button-icon {
-      height: 18px;
-      width: 18px;
-    }
-  }
-
-  @media (max-width: 1024px) {
-    margin-top: 20px;
-    flex-wrap: wrap;
-    justify-content: center;
-
-    li {
-      flex: 1 1 calc(50% - 8px);
-    }
-
-    a {
-      width: 100%;
-      justify-content: center;
-      box-sizing: border-box;
-    }
-  }
+#app .top-bar-logo {
+  color: var(--text-primary);
+  font-weight: 800;
 }
 
-#spacer {
-  height: 88px;
-  border-top: 1px solid var(--border);
-  @media (max-width: 1024px) {
-    height: 48px;
-  }
+#app .left-sidebar {
+  background: linear-gradient(165deg, #14161f 0%, #0d0e14 100%);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border-right: 1px solid var(--hairline);
+  box-shadow: 12px 0 32px var(--shadow-dark-soft), inset -1px 0 0 rgba(255, 255, 255, 0.02);
 }
 
-.ticks {
-  position: relative;
-  width: 100%;
+#app .right-sidebar {
+  background: linear-gradient(165deg, #14161f 0%, #0d0e14 100%);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border-left: 1px solid var(--hairline);
+  box-shadow: -12px 0 32px var(--shadow-dark-soft), inset 1px 0 0 rgba(255, 255, 255, 0.02);
+}
 
-  &::before,
-  &::after {
-    content: '';
-    position: absolute;
-    top: -4.5px;
-    border: 5px solid transparent;
-  }
+#app .glass-panel {
+  background: linear-gradient(155deg, #14161f 0%, #0d0e14 100%);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border: 1px solid var(--hairline);
+  box-shadow:
+    8px 8px 20px var(--shadow-dark),
+    -6px -6px 16px var(--shadow-light),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
 
-  &::before {
-    left: 0;
-    border-left-color: var(--border);
-  }
-  &::after {
-    right: 0;
-    border-right-color: var(--border);
+/* =============================================================================
+   Sidebar header / collapse control
+   ========================================================================= */
+
+#app .sidebar-header {
+  border-bottom: 1px solid var(--hairline);
+}
+
+#app .sidebar-header-title {
+  color: var(--text-tertiary);
+  font-weight: 800;
+}
+
+#app .sidebar-collapse-btn {
+  color: var(--text-tertiary);
+  border-radius: var(--r-xs);
+  transition: color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+
+#app .sidebar-collapse-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+#app .sidebar-rocket-icon {
+  border-radius: var(--r-sm);
+  transition: background var(--dur-fast) var(--ease-out);
+}
+
+#app .sidebar-rocket-icon:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* =============================================================================
+   Form — section titles, labels, neomorphic inset wells for inputs/selects
+   ========================================================================= */
+
+#app .form-section-title {
+  color: var(--text-tertiary);
+  border-top-color: var(--hairline);
+  font-weight: 700;
+}
+
+#app .form-field label {
+  color: var(--text-secondary);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+#app .form-field input,
+#app .form-field select {
+  background: linear-gradient(160deg, var(--well) 0%, var(--well-2) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: var(--r-sm);
+  color: var(--text-primary);
+  box-shadow:
+    inset 2px 2px 5px rgba(0, 0, 0, 0.55),
+    inset -2px -2px 5px rgba(255, 255, 255, 0.03);
+  transition: box-shadow var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+}
+
+#app .form-field input:hover,
+#app .form-field select:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+#app .form-field input:focus,
+#app .form-field select:focus {
+  border-color: var(--accent);
+  box-shadow:
+    inset 2px 2px 5px rgba(0, 0, 0, 0.55),
+    inset -2px -2px 5px rgba(255, 255, 255, 0.03),
+    0 0 0 3px var(--accent-soft);
+}
+
+#app .form-field select option {
+  background: var(--surface-2);
+  color: var(--text-primary);
+}
+
+/* =============================================================================
+   Quick presets — raised neomorphic pills, pressed on click
+   ========================================================================= */
+
+#app .preset-btn {
+  background: linear-gradient(160deg, var(--surface-1) 0%, var(--surface-2) 100%);
+  border: 1px solid rgba(77, 163, 255, 0.28);
+  color: var(--accent-bright);
+  border-radius: var(--r-xs);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  box-shadow: 3px 3px 8px var(--shadow-dark), -3px -3px 8px var(--shadow-light);
+  transition:
+    box-shadow var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+
+#app .preset-btn:hover {
+  color: #fff;
+  border-color: rgba(77, 163, 255, 0.5);
+  box-shadow: 4px 4px 11px var(--shadow-dark), -4px -4px 11px var(--shadow-light);
+  transform: translateY(-1px);
+}
+
+#app .preset-btn:active {
+  box-shadow: inset 2px 2px 5px var(--shadow-dark), inset -2px -2px 5px var(--shadow-light);
+  transform: translateY(0) scale(0.98);
+}
+
+/* =============================================================================
+   LAUNCH button — the sidebar's primary action: real depth + hover/press glow
+   ========================================================================= */
+
+#app .launch-btn {
+  background: linear-gradient(160deg, #2f8bff 0%, #0f5fd6 100%);
+  border-radius: var(--r-md);
+  box-shadow:
+    0 6px 16px rgba(26, 115, 232, 0.32),
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    inset 0 -2px 5px rgba(0, 0, 0, 0.22);
+  transition:
+    box-shadow var(--dur-med) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out),
+    filter var(--dur-fast) var(--ease-out);
+}
+
+#app .launch-btn:hover {
+  box-shadow:
+    0 10px 22px rgba(26, 115, 232, 0.42),
+    0 0 28px var(--accent-glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    inset 0 -2px 5px rgba(0, 0, 0, 0.22);
+  transform: translateY(-2px);
+  filter: brightness(1.05);
+}
+
+#app .launch-btn:active {
+  transform: translateY(0) scale(0.98);
+  box-shadow:
+    0 2px 8px rgba(26, 115, 232, 0.32),
+    inset 0 2px 6px rgba(0, 0, 0, 0.35);
+  filter: brightness(0.96);
+}
+
+#app .launch-btn:disabled {
+  background: linear-gradient(160deg, #2a3040 0%, #1b1f29 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+#app .form-error {
+  color: var(--danger);
+}
+
+/* =============================================================================
+   Sidebar loading state
+   ========================================================================= */
+
+#app .sidebar-spinner {
+  border-color: rgba(255, 255, 255, 0.08);
+  border-top-color: var(--accent-bright);
+}
+
+#app .sidebar-loading-msg {
+  color: var(--text-secondary);
+}
+
+#app .sidebar-loading-progress {
+  background: var(--well);
+  box-shadow: inset 1px 1px 3px rgba(0, 0, 0, 0.5);
+}
+
+#app .sidebar-loading-bar {
+  background: linear-gradient(90deg, var(--accent), var(--accent-bright));
+}
+
+/* =============================================================================
+   Results panel — OPTIMAL LAUNCH WINDOWS cards
+   ========================================================================= */
+
+#app .results-header {
+  color: var(--text-tertiary);
+  font-weight: 800;
+  letter-spacing: 0.1em;
+}
+
+#app .window-card {
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.035) 0%, rgba(255, 255, 255, 0.012) 100%);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  box-shadow: 5px 5px 14px var(--shadow-dark-soft), -4px -4px 12px var(--shadow-light);
+  transition:
+    transform var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+
+#app .window-card:hover {
+  transform: translateY(-3px);
+  border-color: var(--hairline-strong);
+  box-shadow: 8px 8px 18px var(--shadow-dark-soft), -6px -6px 14px var(--shadow-light);
+}
+
+#app .window-card.selected {
+  border-color: rgba(77, 163, 255, 0.55);
+  background: linear-gradient(160deg, rgba(26, 115, 232, 0.16) 0%, rgba(26, 115, 232, 0.03) 100%);
+  box-shadow:
+    5px 5px 14px var(--shadow-dark-soft),
+    -4px -4px 12px var(--shadow-light),
+    0 0 20px rgba(26, 115, 232, 0.22);
+}
+
+#app .window-card-rank {
+  color: var(--accent-bright);
+  font-weight: 800;
+}
+
+#app .window-card-date {
+  color: var(--text-primary);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+#app .window-card-stats {
+  color: var(--text-secondary);
+}
+
+#app .stat-label {
+  color: var(--text-tertiary);
+  font-family: var(--font-sans);
+}
+
+/* =============================================================================
+   Legend chips (satellite category toggles) + view tabs
+   ========================================================================= */
+
+#app .sat-toggle {
+  background: linear-gradient(160deg, var(--surface-1) 0%, var(--surface-2) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: var(--r-pill);
+  color: var(--text-secondary);
+  font-weight: 600;
+  box-shadow: 2px 2px 6px var(--shadow-dark-soft), -2px -2px 6px var(--shadow-light);
+  transition:
+    box-shadow var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+
+#app .sat-toggle:hover {
+  transform: translateY(-1px);
+  border-color: var(--hairline-strong);
+}
+
+#app .sat-toggle.active {
+  border-color: currentColor;
+  box-shadow: inset 2px 2px 5px var(--shadow-dark-soft), inset -2px -2px 5px var(--shadow-light);
+}
+
+#app .view-btns {
+  padding: 3px;
+  border-radius: var(--r-pill);
+  background: rgba(0, 0, 0, 0.35);
+  box-shadow: inset 2px 2px 5px rgba(0, 0, 0, 0.5), inset -1px -1px 3px rgba(255, 255, 255, 0.03);
+}
+
+#app .view-btn {
+  border-radius: var(--r-pill);
+  color: var(--text-tertiary);
+  font-weight: 700;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+
+#app .view-btn:hover {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.06);
+}
+
+#app .view-btn.active {
+  background: linear-gradient(160deg, var(--accent-bright) 0%, var(--accent) 100%);
+  color: #fff;
+  border-color: transparent;
+  box-shadow: 0 3px 10px rgba(26, 115, 232, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+
+/* =============================================================================
+   Top-bar search
+   ========================================================================= */
+
+#app .top-bar-search {
+  background: linear-gradient(160deg, var(--well) 0%, var(--well-2) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--r-pill);
+  color: var(--text-primary);
+  box-shadow: inset 1px 1px 3px rgba(0, 0, 0, 0.5);
+  transition: border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), width var(--dur-med) var(--ease-out);
+}
+
+#app .top-bar-search:focus {
+  border-color: var(--accent);
+  box-shadow: inset 1px 1px 3px rgba(0, 0, 0, 0.5), 0 0 0 3px var(--accent-soft);
+}
+
+/* =============================================================================
+   Playback controls (bottom transport)
+   ========================================================================= */
+
+#app .play-controls-row {
+  gap: 12px;
+}
+
+#app .play-btn {
+  background: linear-gradient(160deg, var(--accent-bright) 0%, var(--accent) 100%);
+  box-shadow: 0 4px 12px rgba(26, 115, 232, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+
+#app .play-btn:hover {
+  box-shadow: 0 6px 18px rgba(26, 115, 232, 0.5), 0 0 22px var(--accent-glow), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+
+#app .play-btn:active {
+  box-shadow: inset 2px 2px 6px rgba(0, 0, 0, 0.4), inset -1px -1px 3px rgba(255, 255, 255, 0.05);
+}
+
+#app .timeline-scrubber {
+  background: linear-gradient(90deg, var(--accent) 0%, rgba(255, 255, 255, 0.08) 100%);
+  box-shadow: inset 1px 1px 3px rgba(0, 0, 0, 0.5);
+}
+
+#app .timeline-scrubber::-webkit-slider-thumb {
+  background: var(--accent-bright);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5), 0 0 8px rgba(26, 115, 232, 0.5);
+}
+
+#app .timeline-scrubber::-moz-range-thumb {
+  background: var(--accent-bright);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5), 0 0 8px rgba(26, 115, 232, 0.5);
+}
+
+#app .speed-btn {
+  border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-tertiary);
+  box-shadow: 2px 2px 5px var(--shadow-dark-soft), -2px -2px 5px var(--shadow-light);
+  transition: box-shadow var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+}
+
+#app .speed-btn:hover {
+  color: var(--text-secondary);
+}
+
+#app .speed-btn.active {
+  color: #fff;
+  border-color: var(--accent);
+  box-shadow: inset 2px 2px 4px var(--shadow-dark-soft), inset -1px -1px 3px var(--shadow-light);
+}
+
+#app .phase-status {
+  color: var(--text-secondary);
+  font-weight: 700;
+}
+
+/* =============================================================================
+   Info panel + object inspector
+   ========================================================================= */
+
+#app .info-panel-objects {
+  color: var(--text-secondary);
+}
+
+#app .info-panel-clock {
+  color: var(--text-tertiary);
+}
+
+#app .info-panel-source {
+  color: #3d4658;
+}
+
+#app .object-info {
+  border: 1px solid rgba(0, 224, 255, 0.22);
+  box-shadow: 8px 8px 20px var(--shadow-dark), -4px -4px 14px var(--shadow-light);
+}
+
+/* =============================================================================
+   Accessibility — focus rings + reduced motion
+   ========================================================================= */
+
+#app button:focus-visible,
+#app input:focus-visible,
+#app select:focus-visible,
+#app [tabindex]:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #app * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

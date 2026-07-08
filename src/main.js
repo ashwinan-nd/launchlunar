@@ -14,7 +14,7 @@ import {
   eciToThreeJs,
   getMoonPosition,
   findOptimalLaunchWindows,
-  generateSmoothTrajectory,
+  computeGmst,
   EARTH_RADIUS_KM,
 } from './orbital.js';
 import { fetchN2YOData } from './n2yo-fetcher.js';
@@ -1327,6 +1327,13 @@ function selectWindow(idx, windows, formValues) {
   stopPlayback();
   computePhaseFractions(w);
 
+  // Move the Moon to the window's ARRIVAL position and freeze the Earth spin so the
+  // inertial ECI trajectory (frozen at launchDate) lines up with the Moon mesh, the
+  // landing marker and the launch beacon. Do this BEFORE drawing the trajectory.
+  const moonPosThree = eciToThreeJs(w.moonArrivalPosition);
+  scene.setMoonPosition(moonPosThree);
+  scene.freezeEarthRotationAt(computeGmst(w.launchDate));
+
   // Build trajectory
   const trajPoints = w.trajectory.waypoints.map((wp) => eciToThreeJs(wp.position));
   scene.showTrajectory(trajPoints, 0xff0000);
@@ -1336,7 +1343,6 @@ function selectWindow(idx, windows, formValues) {
   buildTrajectoryCurve(scene, trajPoints);
 
   // Show landing site on Moon
-  const moonPosThree = eciToThreeJs(w.moonArrivalPosition);
   const landingLatRad = (w.landingSite.lat || 0) * (Math.PI / 180);
   const landingLonRad = (w.landingSite.lon || 0) * (Math.PI / 180);
   const moonRadiusThree = 1737.4 / EARTH_RADIUS_KM;
@@ -1349,8 +1355,10 @@ function selectWindow(idx, windows, formValues) {
     z: moonPosThree.z + localZ,
   });
 
-  // Show launch site on Earth
-  const earthSurfacePos = scene.latLonToVector3(formValues.lat, formValues.lon);
+  // Show launch site on Earth — use the TRUE ECI launch surface point (GMST-based,
+  // the physics start), not the texture-convention lat/lon, so the beacon coincides
+  // with the actual trajectory start.
+  const earthSurfacePos = eciToThreeJs(w.trajectory.waypoints[0].position);
   scene.showLaunchSite({
     x: earthSurfacePos.x,
     y: earthSurfacePos.y,
@@ -2074,9 +2082,12 @@ async function loadInitialOrbitalData() {
   }
   scene.setMoonOrbitFromPositions(orbitPoints);
 
-  // Continuously update Moon position every 10 seconds using Meeus
+  // Continuously update Moon position every 10 seconds using Meeus — but NOT while a
+  // launch window/trajectory is active. In that case the Moon is pinned to the
+  // window's arrival position so it stays at the end of the rendered trajectory.
   setInterval(() => {
     if (!state.scene) return;
+    if (state.launchWindows && state.launchWindows.length > 0 && state.selectedWindowIndex >= 0) return;
     const currentMoonPos = getMoonPosition(new Date());
     const currentMoonThree = eciToThreeJs(currentMoonPos);
     state.scene.setMoonPosition(currentMoonThree);
@@ -2220,6 +2231,12 @@ async function handleLaunch() {
 
       computePhaseFractions(w);
 
+      // Move the Moon to the ARRIVAL position and freeze the Earth spin BEFORE drawing
+      // the trajectory so Moon mesh + landing marker + trajectory end + beacon coincide.
+      const moonPosThree = eciToThreeJs(w.moonArrivalPosition);
+      state.scene.setMoonPosition(moonPosThree);
+      state.scene.freezeEarthRotationAt(computeGmst(w.launchDate));
+
       const trajPoints = w.trajectory.waypoints.map((wp) => eciToThreeJs(wp.position));
       state.scene.showTrajectory(trajPoints, 0xff0000);
       addTrajectoryTickMarks(state.scene, w);
@@ -2229,7 +2246,6 @@ async function handleLaunch() {
       showWindowRisks(state.scene, w);
 
       // Show markers
-      const moonPosThree = eciToThreeJs(w.moonArrivalPosition);
       const landingLatRad = (w.landingSite.lat || 0) * (Math.PI / 180);
       const landingLonRad = (w.landingSite.lon || 0) * (Math.PI / 180);
       const moonRadiusThree = 1737.4 / EARTH_RADIUS_KM;
@@ -2242,7 +2258,8 @@ async function handleLaunch() {
         z: moonPosThree.z + localZ,
       });
 
-      const earthSurfacePos = state.scene.latLonToVector3(values.lat, values.lon);
+      // True ECI launch surface point (physics start), not texture lat/lon.
+      const earthSurfacePos = eciToThreeJs(w.trajectory.waypoints[0].position);
       state.scene.showLaunchSite({
         x: earthSurfacePos.x,
         y: earthSurfacePos.y,
