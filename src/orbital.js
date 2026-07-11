@@ -151,9 +151,16 @@ export function computeGmst(date) {
  */
 export function parseTleAndPropagate(tleLine1, tleLine2, date) {
   const satrec = satellite.twoline2satrec(tleLine1, tleLine2);
-  const positionAndVelocity = satellite.propagate(satrec, date);
+  let positionAndVelocity = null;
+  try {
+    // satellite.propagate returns NULL for decayed/invalid epochs
+    positionAndVelocity = satellite.propagate(satrec, date);
+  } catch (e) {
+    positionAndVelocity = null;
+  }
 
   if (
+    !positionAndVelocity ||
     positionAndVelocity.position === false ||
     positionAndVelocity.position === undefined
   ) {
@@ -227,6 +234,24 @@ function getMoonPositionCached(date) {
   const result = getMoonPosition(date);
   _moonPosCache.set(key, result);
   return result;
+}
+
+/**
+ * Moon velocity (km/s) by central finite difference on the UNCACHED ephemeris.
+ * Never use cached positions for finite differences: the 10-minute cache
+ * buckets turn a ±30 s difference into a 600 s displacement divided by 60 s,
+ * inflating the velocity ~10×.
+ * @param {Date} date
+ * @returns {{x:number, y:number, z:number}}
+ */
+export function getMoonVelocity(date) {
+  const before = getMoonPosition(new Date(date.getTime() - 30000));
+  const after = getMoonPosition(new Date(date.getTime() + 30000));
+  return {
+    x: (after.x - before.x) / 60,
+    y: (after.y - before.y) / 60,
+    z: (after.z - before.z) / 60,
+  };
 }
 
 // ─── 4. Moon Position (Simplified Brown's Lunar Theory) ─────────────────────────
@@ -488,7 +513,7 @@ export function getMoonPosition(date) {
  * @param {function} accelFn - (pos, vel, t) => {x,y,z} acceleration in km/s²
  * @returns {{ pos: {x,y,z}, vel: {x,y,z} }}
  */
-function rk4Step(pos, vel, t, dt, accelFn) {
+export function rk4Step(pos, vel, t, dt, accelFn) {
   const k1v = accelFn(pos, vel, t);
   const k1r = vel;
 
@@ -737,79 +762,109 @@ export function calculateTranslunarTrajectory(
   });
   lastRecordTime = 0;
 
-  // Gravity turn ascent model
-  // gamma = flight path angle (angle of velocity above local horizontal)
-  // Starts at 90 degrees (vertical), pitches over gradually
+  // ── Launch-azimuth plane targeting ──
+  // Steer the gravity turn INTO the plane containing both the launch site and
+  // the Moon at nominal arrival (~4 days). The Lambert solver downstream can
+  // absorb residual plane error, but every degree of misalignment costs real
+  // ΔV — and deriving the plane from the raw burnout state made it garbage for
+  // high-TWR vehicles (nearly-radial velocity at cutoff ⇒ meaningless h-vector
+  // ⇒ multi-km/s Lambert plane changes ⇒ escape).
+  const moonAtPlaneEst = getMoonPositionCached(
+    dateAddSeconds(launchDate, 4.0 * SECONDS_PER_DAY)
+  );
+  let targetPlaneNormal = vecCross(launchPosEci, {
+    x: moonAtPlaneEst.x, y: moonAtPlaneEst.y, z: moonAtPlaneEst.z,
+  });
+  if (vecMag(targetPlaneNormal) < 1e-6) {
+    targetPlaneNormal = vecCross(launchPosEci, { x: 0, y: 0, z: 1 });
+  }
+  if (targetPlaneNormal.z < 0) targetPlaneNormal = vecScale(targetPlaneNormal, -1);
+  targetPlaneNormal = vecNormalize(targetPlaneNormal);
+
+  // Gravity turn ascent model with MECO: cut the engine once the ballistic
+  // apoapsis reaches the LEO target, then coast to apoapsis. Burning until
+  // LEO ALTITUDE (the old model) makes high-thrust vehicles hit 200 km nearly
+  // vertically at absurd speeds, and underpowered vehicles silently "reach
+  // orbit" after burnout — both dishonest.
   const pitchOverStartAlt = 1; // km - begin pitch over
   const pitchOverEndAlt = 150; // km - nearly horizontal by this altitude
   let burnedOut = false;
+  let engineCutoff = false; // MECO: ballistic apoapsis has reached LEO target
 
   while (true) {
     const r = vecMag(pos);
     const altKm = r - rEarth;
+    const rHat = vecNormalize(pos);
+    const vMag = vecMag(vel);
+    const vDotR = vecDot(vel, rHat);
 
-    // Check if we've reached LEO altitude
+    // Reached LEO altitude while still ascending — insertion point
     if (altKm >= LEO_ALTITUDE_KM) break;
 
-    // Check for mass exhaustion (prevent negative mass)
-    if (currentMass <= payload) {
+    // After MECO: coast ballistically to apoapsis, then circularize there
+    if (engineCutoff && vDotR <= 0 && altKm > 80) break;
+
+    // Mass exhaustion before achieving orbital energy
+    if (!engineCutoff && currentMass <= payload) {
       burnedOut = true;
       break;
+    }
+
+    // Guard: underpowered vehicles (TWR < 1) must not spin forever
+    if (tElapsed > 3600) {
+      burnedOut = true;
+      break;
+    }
+
+    // MECO check: ballistic apoapsis at the LEO target ends the burn
+    if (!engineCutoff && altKm > 40) {
+      const eps = (vMag * vMag) / 2 - mu / r;
+      if (eps < 0) {
+        const a = -mu / (2 * eps);
+        const hMag = vecMag(vecCross(pos, vel));
+        const e2 = Math.max(0, 1 + (2 * eps * hMag * hMag) / (mu * mu));
+        const rApo = a * (1 + Math.sqrt(e2));
+        if (rApo >= rEarth + LEO_ALTITUDE_KM) {
+          engineCutoff = true;
+        }
+      }
     }
 
     // Current gravity magnitude
     const gLocal = mu / (r * r); // km/s²
 
-    // Position unit vector (radial outward)
-    const rHat = vecNormalize(pos);
-
-    // Velocity magnitude
-    const vMag = vecMag(vel);
-
-    // Flight path angle: angle between velocity and local horizontal
-    // sin(gamma) = (v . rHat) / |v|
-    const vDotR = vecDot(vel, rHat);
-    const sinGamma = vMag > 1e-10 ? vDotR / vMag : 1;
-    const gamma = Math.asin(Math.max(-1, Math.min(1, sinGamma)));
-
-    // Thrust direction: follows a gravity turn profile
-    // At low altitude, thrust is nearly vertical. As speed builds, it pitches over.
+    // Thrust direction: gravity turn steered into the TARGET plane
     let thrustDir;
     if (altKm < pitchOverStartAlt) {
-      // Pure vertical
-      thrustDir = rHat;
+      thrustDir = rHat; // pure vertical
     } else if (altKm < pitchOverEndAlt) {
-      // Gravity turn: thrust along velocity vector (natural pitch-over)
-      // Blend from radial to velocity direction
       const pitchFrac = (altKm - pitchOverStartAlt) / (pitchOverEndAlt - pitchOverStartAlt);
-      const velDir = vMag > 1e-10 ? vecNormalize(vel) : rHat;
-      // Smoothly transition: at pitchFrac=0 thrust is radial, at pitchFrac=1 thrust is prograde
+      const downrange = vecNormalize(vecCross(targetPlaneNormal, rHat));
       const blendFrac = pitchFrac * pitchFrac * (3 - 2 * pitchFrac); // smoothstep
       thrustDir = vecNormalize(
-        vecAdd(vecScale(rHat, 1 - blendFrac), vecScale(velDir, blendFrac))
+        vecAdd(vecScale(rHat, 1 - blendFrac), vecScale(downrange, blendFrac))
       );
     } else {
-      // Above pitch-over altitude: thrust along velocity (prograde)
-      thrustDir = vMag > 1e-10 ? vecNormalize(vel) : rHat;
+      const downrange = vecNormalize(vecCross(targetPlaneNormal, rHat));
+      thrustDir = vecNormalize(vecAdd(vecScale(downrange, 0.95), vecScale(rHat, 0.05)));
     }
 
-    // Thrust acceleration magnitude (km/s²)
-    const thrustAccelMag = (thrustN / 1000) / currentMass; // N/kg -> km/s² (F/m / 1000)
+    // Thrust acceleration magnitude (km/s²) — zero after MECO
+    const thrustAccelMag = engineCutoff ? 0 : (thrustN / 1000) / currentMass;
 
-    // Total acceleration: thrust + gravity
     const thrustAccel = vecScale(thrustDir, thrustAccelMag);
     const gravAccel = vecScale(rHat, -gLocal);
     const totalAccel = vecAdd(thrustAccel, gravAccel);
 
-    // Simple Euler integration for ascent (short timesteps make this adequate,
-    // but we use a function-based approach for consistency)
     const accelFnAscent = () => totalAccel;
     const step = rk4Step(pos, vel, tElapsed, ascentDt, accelFnAscent);
     pos = step.pos;
     vel = step.vel;
 
-    // Update mass
-    currentMass -= mdot * ascentDt;
+    // Update mass (propellant only flows while the engine burns)
+    if (!engineCutoff) {
+      currentMass -= mdot * ascentDt;
+    }
     tElapsed += ascentDt;
 
     // Record waypoint at intervals
@@ -838,13 +893,32 @@ export function calculateTranslunarTrajectory(
 
   const massAfterAscent = currentMass;
 
-  // Establish a clean 200 km circular parking orbit at LEO insertion. The ascent
-  // waypoints above are the visual climb; here we anchor the physics to a proper
-  // parking orbit (radius = rLeo) in the launch plane so Lambert targeting and the
-  // transfer integration start from a realistic state rather than a near-surface point.
-  const hVec = vecCross(pos, vel); // angular momentum defines the orbit plane
-  const hHat = vecNormalize(hVec);
-  pos = vecScale(vecNormalize(pos), rLeo);
+  // Ascent failure: propellant exhausted (or timed out) before the ballistic
+  // apoapsis ever reached the LEO target — the vehicle cannot make orbit.
+  // Report honestly instead of pretending it reached LEO.
+  if (burnedOut && !engineCutoff) {
+    return {
+      waypoints,
+      deltaV: { toLeo: 0, tli: 0, loi: 0, total: 0 },
+      flightDuration: tElapsed,
+      landingTarget: null,
+      tliState: null,
+      transferOrbit: null,
+      moonPositionAtArrival: getMoonPositionCached(dateAddSeconds(launchDate, tElapsed)),
+      rocketParams: { massKg, thrustN, specificImpulseS, payload },
+      massAfterAscent,
+      massFlowRate: mdot,
+      transferResult: 'ascent_failed',
+      closestMoonApproach: Infinity,
+    };
+  }
+
+  // Establish a clean 200 km circular parking orbit at LEO insertion, in the
+  // MOON-TARGETED plane (the ascent steering put the burnout state close to
+  // it; the analytic loss budget below absorbs the cleanup burn).
+  const hHat = targetPlaneNormal;
+  const posInPlane = vecSub(pos, vecScale(hHat, vecDot(pos, hHat)));
+  pos = vecScale(vecNormalize(posInPlane), rLeo);
   const rAtLeo = rLeo;
   const vCircAtLeo = Math.sqrt(mu / rAtLeo);
   const rHatLeo = vecNormalize(pos);
@@ -852,8 +926,7 @@ export function calculateTranslunarTrajectory(
   vel = vecScale(vCircDir, vCircAtLeo);
 
   // Delta-V to LEO: ideal orbital speed gain minus the free launch-site rotation
-  // speed, plus a realistic gravity+drag+steering loss budget (~1.8 km/s). Avoids the
-  // old double-counting that inflated the total to ~14 km/s.
+  // speed, plus a realistic gravity+drag+steering loss budget (~1.8 km/s).
   const surfaceSpeed = vecMag(vecCross(omegaEarth, launchPosEci));
   const ASCENT_LOSSES = 1.8; // km/s, typical gravity+drag+steering losses
   const dvLeo = Math.max(0, vCircAtLeo - surfaceSpeed) + ASCENT_LOSSES;
@@ -1209,6 +1282,20 @@ export function calculateTranslunarTrajectory(
       break;
     }
 
+    // Termination: periselene passage MEANINGFULLY inside the Moon's SOI —
+    // the physically sensible capture point (the LOI burn happens here).
+    // Without this, a perfect 2,000 km flyby keeps integrating, flies away,
+    // and gets mislabeled 'escaped'/'timeout' although the descent machinery
+    // below lands it fine.
+    if (
+      distToMoon < moonSoiRadius * 0.9 &&
+      prevDistToMoon < moonSoiRadius &&
+      distToMoon > prevDistToMoon
+    ) {
+      transferResult = 'periselene';
+      break;
+    }
+
     // Termination: escaped (but only if we're also moving away from Moon)
     if (distFromEarth > maxDistance && distToMoon > moonSoiRadius) {
       transferResult = 'escaped';
@@ -1312,11 +1399,9 @@ export function calculateTranslunarTrajectory(
   const targetEci = vecAdd(moonAtLanding, offsetEci);
 
   // Honest LOI + descent ΔV: cancel excess relative velocity into a low orbit, then land.
-  const moonVelCA = (() => {
-    const a = getMoonPositionCached(dateAddSeconds(launchDate, caTime - 30));
-    const b = getMoonPositionCached(dateAddSeconds(launchDate, caTime + 30));
-    return vecScale(vecSub({ x: b.x, y: b.y, z: b.z }, { x: a.x, y: a.y, z: a.z }), 1 / 60);
-  })();
+  // (Uncached ephemeris — cached ±30 s differences straddle 10-minute cache
+  // buckets and inflate the Moon's velocity ~10×.)
+  const moonVelCA = getMoonVelocity(dateAddSeconds(launchDate, caTime));
   const relSpeedCA = vecMag(vecSub(caVel, moonVelCA));
   const rPeri = Math.max(MOON_RADIUS_KM + 30, closestMoonDist);
   const vInfSq = Math.max(0, relSpeedCA * relSpeedCA - 2 * MOON_MU / rPeri);
@@ -1375,6 +1460,14 @@ export function calculateTranslunarTrajectory(
 
   const landingSite = { lat: landLat, lon: landLon };
 
+  // Honest result label: if the transfer arc entered the Moon's SOI, the LOI
+  // + powered descent above completes the mission — that IS capture, whether
+  // the integrator stopped at periselene, timed out after the pass, or
+  // labeled the discarded fly-away tail 'escaped'.
+  if (arrivalWithinSoi) {
+    transferResult = 'capture';
+  }
+
   // Legacy arrival fabrication (forced-lerp + branch tangle) retained below but
   // permanently disabled — superseded by the real descent above.
   const _legacyArrivalDisabled = false;
@@ -1386,14 +1479,7 @@ export function calculateTranslunarTrajectory(
       const arrivalMoonPos = getMoonPositionCached(dateAddSeconds(launchDate, tElapsed));
       moonPosAtArrival = arrivalMoonPos;
       const arrivalMoonVec = { x: arrivalMoonPos.x, y: arrivalMoonPos.y, z: arrivalMoonPos.z };
-      const moonPosPlus = getMoonPositionCached(dateAddSeconds(launchDate, tElapsed + 60));
-      const moonVelEst = vecScale(
-        vecSub(
-          { x: moonPosPlus.x, y: moonPosPlus.y, z: moonPosPlus.z },
-          arrivalMoonVec
-        ),
-        1.0 / 60
-      );
+      const moonVelEst = getMoonVelocity(dateAddSeconds(launchDate, tElapsed));
       const relVel = vecSub(vel, moonVelEst);
       const relSpeed = vecMag(relVel);
       const rLunarOrbit = MOON_RADIUS_KM + 100;
@@ -1401,15 +1487,7 @@ export function calculateTranslunarTrajectory(
       dvLoi = Math.abs(relSpeed - vCircLunar);
     } else if (closestMoonDist < moonSoiRadius && closestMoonMoonPos) {
       moonPosAtArrival = getMoonPositionCached(dateAddSeconds(launchDate, closestMoonTime));
-      const moonPosBefore = getMoonPositionCached(dateAddSeconds(launchDate, closestMoonTime - 30));
-      const moonPosAfter = getMoonPositionCached(dateAddSeconds(launchDate, closestMoonTime + 30));
-      const moonVelAtCA = vecScale(
-        vecSub(
-          { x: moonPosAfter.x, y: moonPosAfter.y, z: moonPosAfter.z },
-          { x: moonPosBefore.x, y: moonPosBefore.y, z: moonPosBefore.z }
-        ),
-        1.0 / 60
-      );
+      const moonVelAtCA = getMoonVelocity(dateAddSeconds(launchDate, closestMoonTime));
       const relVelCA = vecSub(closestMoonVel, moonVelAtCA);
       const relSpeedCA = vecMag(relVelCA);
       const rLunarOrbit = MOON_RADIUS_KM + 100;
@@ -1429,14 +1507,7 @@ export function calculateTranslunarTrajectory(
     const arrivalMoonVec = { x: arrivalMoonPos.x, y: arrivalMoonPos.y, z: arrivalMoonPos.z };
 
     // Moon's velocity (approximate from finite difference)
-    const moonPosPlus = getMoonPositionCached(dateAddSeconds(launchDate, tElapsed + 60));
-    const moonVelEst = vecScale(
-      vecSub(
-        { x: moonPosPlus.x, y: moonPosPlus.y, z: moonPosPlus.z },
-        arrivalMoonVec
-      ),
-      1.0 / 60
-    );
+    const moonVelEst = getMoonVelocity(dateAddSeconds(launchDate, tElapsed));
 
     // Relative velocity to Moon
     const relVel = vecSub(vel, moonVelEst);
@@ -1502,15 +1573,7 @@ export function calculateTranslunarTrajectory(
     moonPosAtArrival = getMoonPositionCached(dateAddSeconds(launchDate, closestMoonTime));
 
     // Moon velocity at closest approach (finite difference)
-    const moonPosBefore = getMoonPositionCached(dateAddSeconds(launchDate, closestMoonTime - 30));
-    const moonPosAfter = getMoonPositionCached(dateAddSeconds(launchDate, closestMoonTime + 30));
-    const moonVelAtCA = vecScale(
-      vecSub(
-        { x: moonPosAfter.x, y: moonPosAfter.y, z: moonPosAfter.z },
-        { x: moonPosBefore.x, y: moonPosBefore.y, z: moonPosBefore.z }
-      ),
-      1.0 / 60
-    );
+    const moonVelAtCA = getMoonVelocity(dateAddSeconds(launchDate, closestMoonTime));
 
     // Relative velocity at closest approach
     const relVelCA = vecSub(closestMoonVel, moonVelAtCA);
@@ -1577,15 +1640,7 @@ export function calculateTranslunarTrajectory(
     const moonAtCA = { x: moonPosAtArrival.x, y: moonPosAtArrival.y, z: moonPosAtArrival.z };
 
     // Estimate LOI delta-V (higher because we're further out)
-    const moonPosBefore = getMoonPositionCached(dateAddSeconds(launchDate, closestMoonTime - 30));
-    const moonPosAfter = getMoonPositionCached(dateAddSeconds(launchDate, closestMoonTime + 30));
-    const moonVelAtCA = vecScale(
-      vecSub(
-        { x: moonPosAfter.x, y: moonPosAfter.y, z: moonPosAfter.z },
-        { x: moonPosBefore.x, y: moonPosBefore.y, z: moonPosBefore.z }
-      ),
-      1.0 / 60
-    );
+    const moonVelAtCA = getMoonVelocity(dateAddSeconds(launchDate, closestMoonTime));
     const relVelCA = vecSub(closestMoonVel, moonVelAtCA);
     const relSpeedCA = vecMag(relVelCA);
     const rLunarOrbit = MOON_RADIUS_KM + 100;
@@ -2275,7 +2330,7 @@ export function screenConjunctions(waypoints, tleData, launchDate) {
  * Fast analytical pre-screen: compute Hohmann delta-V without RK4.
  * Used to quickly rank candidates before running expensive trajectory sims.
  */
-function quickHohmannScore(launchDate, launchLat, launchLon) {
+export function quickHohmannScore(launchDate, launchLat, launchLon) {
   // Moon position at launch (needed for Hohmann transfer geometry)
   const moonAtLaunch = getMoonPositionCached(launchDate);
   const moonLaunchDist = Math.sqrt(moonAtLaunch.x**2 + moonAtLaunch.y**2 + moonAtLaunch.z**2);

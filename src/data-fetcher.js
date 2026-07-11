@@ -478,27 +478,39 @@ export function processGPData(taggedRecords) {
 // fetchTLEData
 // ---------------------------------------------------------------------------
 
-export async function fetchTLEData({ onProgress, timeoutMs = 30000 } = {}) {
+/**
+ * Fetch all CelesTrak GP groups through a CONCURRENCY-LIMITED queue.
+ *
+ * The old implementation fired all 23 requests simultaneously with one
+ * shared timeout budget: the two largest groups (active, starlink) never
+ * finished downloading before their AbortControllers fired, and the burst
+ * pattern also trips CelesTrak's rate limiting (HTTP 403). A small worker
+ * pool with per-group retry fixes both failure modes.
+ *
+ * @returns {Promise<{objects: Array, failures: Array<{group: string, error: string}>, usedFallback: boolean}>}
+ */
+export async function fetchTLEData({
+  onProgress,
+  timeoutMs = 45000,
+  concurrency = 4,
+  retries = 1,
+} = {}) {
   const total = GP_GROUPS.length;
   let completed = 0;
 
   const seenIds = new Set();
   const taggedRecords = [];
+  const failures = [];
 
-  const promises = GP_GROUPS.map(async (group) => {
+  async function fetchGroupOnce(group) {
     const url = `${GP_BASE_URL}?GROUP=${encodeURIComponent(group)}&FORMAT=json`;
-
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-
       const response = await fetch(url, { signal: controller.signal });
-      clearTimeout(timer);
-
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status} ${response.statusText}`);
+        throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
       }
-
       const text = await response.text();
       let json;
       try {
@@ -506,11 +518,9 @@ export async function fetchTLEData({ onProgress, timeoutMs = 30000 } = {}) {
       } catch (parseErr) {
         throw new Error('Invalid JSON response');
       }
-
       if (!Array.isArray(json)) {
         throw new Error('Response is not an array');
       }
-
       let added = 0;
       for (const gp of json) {
         const id = gp.NORAD_CAT_ID;
@@ -519,30 +529,62 @@ export async function fetchTLEData({ onProgress, timeoutMs = 30000 } = {}) {
         taggedRecords.push({ gp, sourceGroup: group });
         added++;
       }
+      return added;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
-      completed++;
-      if (onProgress) {
-        onProgress({ completed, total, group, status: 'ok', count: added });
+  const queue = [...GP_GROUPS];
+  async function worker() {
+    while (queue.length > 0) {
+      const group = queue.shift();
+      let lastError = null;
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+          const added = await fetchGroupOnce(group);
+          lastError = null;
+          completed++;
+          if (onProgress) {
+            onProgress({ completed, total, group, status: 'ok', count: added });
+          }
+          break;
+        } catch (err) {
+          lastError = err;
+          if (attempt < retries) {
+            // Back off before the retry (longer if rate-limited)
+            const isRateLimit = /403|429/.test(String(err.message));
+            await new Promise((r) => setTimeout(r, isRateLimit ? 4000 : 1500));
+          }
+        }
       }
-    } catch (err) {
-      completed++;
-      console.warn(`[data-fetcher] Failed to fetch group "${group}":`, err.message || err);
-      if (onProgress) {
-        onProgress({ completed, total, group, status: 'error', error: err.message || String(err) });
+      if (lastError) {
+        completed++;
+        const msg = lastError.message || String(lastError);
+        failures.push({ group, error: msg });
+        console.warn(`[data-fetcher] Failed to fetch group "${group}":`, msg);
+        if (onProgress) {
+          onProgress({ completed, total, group, status: 'error', error: msg });
+        }
       }
     }
-  });
+  }
 
-  await Promise.all(promises);
+  const workerCount = Math.min(concurrency, GP_GROUPS.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
   if (taggedRecords.length === 0) {
     console.warn('[data-fetcher] All fetches failed — using fallback TLE data.');
-    return processGPData(
-      FALLBACK_TLE_DATA.map((gp) => ({ gp, sourceGroup: gp._sourceGroup || 'fallback' }))
-    );
+    return {
+      objects: processGPData(
+        FALLBACK_TLE_DATA.map((gp) => ({ gp, sourceGroup: gp._sourceGroup || 'fallback' }))
+      ),
+      failures,
+      usedFallback: true,
+    };
   }
 
-  return processGPData(taggedRecords);
+  return { objects: processGPData(taggedRecords), failures, usedFallback: false };
 }
 
 // ---------------------------------------------------------------------------

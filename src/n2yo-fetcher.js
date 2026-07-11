@@ -84,10 +84,11 @@ function geodeticToECI(latDeg, lngDeg, altKm, date) {
 
 // ---------------------------------------------------------------------------
 // Convert ECI to Three.js coordinate system
-// Same mapping as orbital.js eciToThreeJs:
+// Same mapping as orbital.js eciToThreeJs (see its docstring for why the
+// Z-axis negation is required to preserve handedness):
 //   Three.js X = ECI X / R_earth
 //   Three.js Y = ECI Z / R_earth  (up)
-//   Three.js Z = ECI Y / R_earth
+//   Three.js Z = -ECI Y / R_earth
 // ---------------------------------------------------------------------------
 
 function eciToThreeJsLocal(eciPos) {
@@ -95,7 +96,7 @@ function eciToThreeJsLocal(eciPos) {
   return {
     x: eciPos.x * scale,
     y: eciPos.z * scale,
-    z: eciPos.y * scale,
+    z: -eciPos.y * scale,
   };
 }
 
@@ -103,6 +104,15 @@ function eciToThreeJsLocal(eciPos) {
 // Fetch satellites above a single observer point for a single category
 // ---------------------------------------------------------------------------
 
+/**
+ * @returns {Promise<{sats: Array, error: string|null}>}
+ *
+ * N2YO answers quota exhaustion and bad/missing API keys with an HTTP 200
+ * whose body is an error JSON WITHOUT the `above` array. The old code
+ * silently mapped that to "0 satellites found" — every request looked
+ * healthy in the network tab while the whole integration was dead. Detect
+ * and REPORT the reason instead.
+ */
 async function fetchAboveObserver(observer, category, timeoutMs) {
   const { lat, lng } = observer;
   const url = `${API_PREFIX}/above/${lat}/${lng}/${OBSERVER_ALT}/${SEARCH_RADIUS}/${category}?`;
@@ -115,29 +125,32 @@ async function fetchAboveObserver(observer, category, timeoutMs) {
     clearTimeout(timer);
 
     if (!response.ok) {
-      return [];
+      return { sats: [], error: `HTTP ${response.status}` };
     }
 
     const json = await response.json();
 
     if (!json.above || !Array.isArray(json.above)) {
-      return [];
+      // Error body: {error: "..."} or an info-only response with no data
+      const reason = json && json.error
+        ? String(json.error)
+        : 'response has no "above" array (invalid API key or quota exhausted?)';
+      return { sats: [], error: reason };
     }
 
-    return json.above.map(sat => ({
-      satid: sat.satid,
-      satname: sat.satname,
-      satlat: sat.satlat,
-      satlng: sat.satlng,
-      satalt: sat.satalt,
-    }));
+    return {
+      sats: json.above.map(sat => ({
+        satid: sat.satid,
+        satname: sat.satname,
+        satlat: sat.satlat,
+        satlng: sat.satlng,
+        satalt: sat.satalt,
+      })),
+      error: null,
+    };
   } catch (err) {
-    if (err.name === 'AbortError') {
-      console.warn(`[n2yo] Timeout for ${observer.label} cat=${category}`);
-    } else {
-      console.warn(`[n2yo] Fetch failed for ${observer.label} cat=${category}:`, err.message);
-    }
-    return [];
+    const reason = err.name === 'AbortError' ? 'timeout' : (err.message || String(err));
+    return { sats: [], error: reason };
   }
 }
 
@@ -179,20 +192,24 @@ export async function fetchN2YOData(onProgress, timeoutMs = 15000) {
   // Fire all requests in parallel
   const results = await Promise.allSettled(
     tasks.map(async ({ observer, category }) => {
-      const sats = await fetchAboveObserver(observer, category, timeoutMs);
+      const outcome = await fetchAboveObserver(observer, category, timeoutMs);
       completed++;
       if (onProgress) {
         onProgress({ completed, total, label: observer.label });
       }
-      return sats;
+      return outcome;
     })
   );
 
-  // Collect all satellite records
+  // Collect all satellite records + failure reasons
   const allSats = [];
+  const errorCounts = new Map();
   for (const result of results) {
-    if (result.status === 'fulfilled' && Array.isArray(result.value)) {
-      allSats.push(...result.value);
+    if (result.status !== 'fulfilled') continue;
+    const { sats, error } = result.value;
+    allSats.push(...sats);
+    if (error) {
+      errorCounts.set(error, (errorCounts.get(error) || 0) + 1);
     }
   }
 
@@ -231,6 +248,15 @@ export async function fetchN2YOData(onProgress, timeoutMs = 15000) {
     });
   }
 
+  // Summarize failures: one line per distinct reason, not per request
+  let failureSummary = null;
+  if (errorCounts.size > 0) {
+    failureSummary = [...errorCounts.entries()]
+      .map(([reason, count]) => `${reason} (${count}/${OBSERVERS.length * N2YO_CATEGORIES.length} requests)`)
+      .join('; ');
+    console.warn(`[n2yo] Degraded: ${failureSummary}`);
+  }
   console.log(`[n2yo] Fetched ${objects.length} unique satellites from ${OBSERVERS.length} observers`);
-  return objects;
+
+  return { objects, failureSummary };
 }

@@ -34,3 +34,7 @@ test-*.js
 .env.local
 .cache-spacetrack/
 HANDOFF.md
+
+# Environment (contains API keys)
+.env
+test-results/

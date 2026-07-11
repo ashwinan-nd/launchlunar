@@ -33,7 +33,10 @@ check('eciToThreeJs is right-handed (det ≈ +1)', Math.abs(det - 1) < 1e-6, `de
 
 // 3. Full trajectory to the Moon for a searched Apollo-11-style window.
 console.log('Trajectory:');
-const rp = { massKg: 50000, thrustN: 1e6, specificImpulseS: 421, payload: 28800 };
+// Full Saturn V stack: the ascent model flies from the pad with MECO at
+// orbital energy — upper-stage-only params cannot reach orbit and now fail
+// honestly instead of being silently teleported to LEO.
+const rp = { massKg: 2970000, thrustN: 35.1e6, specificImpulseS: 304, payload: 45000 };
 const windows = await findOptimalLaunchWindows(
   { lat: 28.5729, lon: -80.649, name: 'KSC' },
   new Date('2026-07-01T00:00:00Z'), new Date('2026-08-31T23:59:59Z'),

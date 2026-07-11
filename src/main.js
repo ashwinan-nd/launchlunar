@@ -912,10 +912,15 @@ function createUTCClock() {
 // Mission Presets
 // ---------------------------------------------------------------------------
 
+// Full-stack (surface-launch) vehicle parameters. The trajectory model flies a
+// single equivalent stage from the pad with MECO at orbital energy, so presets
+// use whole-vehicle liftoff mass/thrust with a stage-averaged specific impulse
+// — upper-stage-only values cannot reach orbit from the surface and honestly
+// fail the ascent.
 const MISSION_PRESETS = [
-  { name: 'Apollo 11', rocket: 'Saturn V S-IVB', mass: 50000, height: 17.8, thrust: 1000, isp: 421, payload: 28800, site: 'Kennedy Space Center, FL', target: 'Mare Tranquillitatis (Apollo 11 site)' },
-  { name: 'Artemis III', rocket: 'SLS Block 1', mass: 130000, height: 64.6, thrust: 8800, isp: 421, payload: 27000, site: 'Kennedy Space Center, FL', target: 'South Pole (Shackleton Crater)' },
-  { name: 'Starship', rocket: 'SpaceX Starship', mass: 1300000, height: 120, thrust: 74500, isp: 380, payload: 100000, site: 'Kennedy Space Center, FL', target: 'Mare Imbrium' },
+  { name: 'Apollo 11', rocket: 'Saturn V', mass: 2970000, height: 110.6, thrust: 35100, isp: 304, payload: 45000, site: 'Kennedy Space Center, FL', target: 'Mare Tranquillitatis (Apollo 11 site)' },
+  { name: 'Artemis III', rocket: 'SLS Block 1', mass: 2610000, height: 98.1, thrust: 39100, isp: 310, payload: 27000, site: 'Kennedy Space Center, FL', target: 'South Pole (Shackleton Crater)' },
+  { name: 'Starship', rocket: 'SpaceX Starship', mass: 5000000, height: 121, thrust: 74500, isp: 350, payload: 100000, site: 'Kennedy Space Center, FL', target: 'Mare Imbrium' },
 ];
 
 // ---------------------------------------------------------------------------
