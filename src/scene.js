@@ -101,41 +101,79 @@ function dampVec3(current, target, lambda, dt) {
 // what they are" when zoomed in. Small (scene units; Earth radius = 1) and
 // merged so each category renders in a single draw call.
 // ---------------------------------------------------------------------------
+// Bake a uniform grayscale vertex color onto a geometry part so merged glyphs
+// carry per-component shading (bright metallic bus, dark solar panels, gold
+// foil) that reads as depth/layering under the instanced material's
+// vertexColors — while still multiplying by the per-category hue.
+function tintPart(geo, shade) {
+  const n = geo.attributes.position.count;
+  const col = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { col[i * 3] = shade; col[i * 3 + 1] = shade; col[i * 3 + 2] = shade; }
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return geo;
+}
+
 function buildSatelliteGlyphGeometry() {
-  const body = new THREE.BoxGeometry(0.006, 0.006, 0.009);
-  const panelL = new THREE.BoxGeometry(0.016, 0.0008, 0.006).translate(-0.013, 0, 0);
-  const panelR = new THREE.BoxGeometry(0.016, 0.0008, 0.006).translate(0.013, 0, 0);
-  const geo = mergeGeometries([body, panelL, panelR]);
-  body.dispose(); panelL.dispose(); panelR.dispose();
+  // Bus + twin dual-segment solar arrays + a nadir comms dish.
+  const body = tintPart(new THREE.BoxGeometry(0.006, 0.006, 0.010), 1.25);
+  const boomL = tintPart(new THREE.BoxGeometry(0.006, 0.0006, 0.0018).translate(-0.007, 0, 0), 0.9);
+  const boomR = tintPart(new THREE.BoxGeometry(0.006, 0.0006, 0.0018).translate(0.007, 0, 0), 0.9);
+  const panelL1 = tintPart(new THREE.BoxGeometry(0.009, 0.0006, 0.006).translate(-0.015, 0, 0), 0.5);
+  const panelL2 = tintPart(new THREE.BoxGeometry(0.009, 0.0006, 0.006).translate(-0.025, 0, 0), 0.45);
+  const panelR1 = tintPart(new THREE.BoxGeometry(0.009, 0.0006, 0.006).translate(0.015, 0, 0), 0.5);
+  const panelR2 = tintPart(new THREE.BoxGeometry(0.009, 0.0006, 0.006).translate(0.025, 0, 0), 0.45);
+  const dish = tintPart(new THREE.CylinderGeometry(0.0032, 0.0032, 0.0016, 8).rotateX(Math.PI / 2).translate(0, -0.005, 0), 1.4);
+  const geo = mergeGeometries([body, boomL, boomR, panelL1, panelL2, panelR1, panelR2, dish]);
+  [body, boomL, boomR, panelL1, panelL2, panelR1, panelR2, dish].forEach((g) => g.dispose());
   return geo;
 }
 function buildDebrisGlyphGeometry() {
-  // Irregular: jitter an icosahedron's vertices for a non-uniform silhouette.
-  const geo = new THREE.IcosahedronGeometry(0.005, 0);
-  const pos = geo.attributes.position;
+  // Irregular tumbling fragment: jitter an icosahedron + a smaller shard.
+  const main = new THREE.IcosahedronGeometry(0.005, 0);
+  const pos = main.attributes.position;
   for (let i = 0; i < pos.count; i++) {
-    const j = 0.45 + Math.random() * 0.75;
+    const j = 0.45 + Math.random() * 0.85;
     pos.setXYZ(i, pos.getX(i) * j, pos.getY(i) * j, pos.getZ(i) * j);
   }
-  geo.computeVertexNormals();
+  main.computeVertexNormals();
+  tintPart(main, 1.0);
+  const shard = tintPart(new THREE.TetrahedronGeometry(0.003, 0).translate(0.004, 0.003, 0.002), 0.7);
+  const geo = mergeGeometries([main, shard]);
+  main.dispose(); shard.dispose();
   return geo;
 }
 function buildRocketGlyphGeometry() {
-  const geo = new THREE.CylinderGeometry(0.0028, 0.0028, 0.018, 8);
+  // Spent stage: cylinder body + a flared nozzle bell + interstage ring.
+  const body = tintPart(new THREE.CylinderGeometry(0.0028, 0.0028, 0.016, 10), 1.15);
+  const ring = tintPart(new THREE.CylinderGeometry(0.0032, 0.0032, 0.0018, 10).translate(0, 0.006, 0), 0.6);
+  const bell = tintPart(new THREE.ConeGeometry(0.0034, 0.004, 10, 1, true).translate(0, -0.010, 0), 0.75);
+  const geo = mergeGeometries([body, ring, bell]);
+  body.dispose(); ring.dispose(); bell.dispose();
   return geo;
 }
 function buildStationGlyphGeometry() {
-  const body = new THREE.BoxGeometry(0.008, 0.008, 0.014);
-  const truss = new THREE.BoxGeometry(0.03, 0.0012, 0.007);
-  const geo = mergeGeometries([body, truss]);
-  body.dispose(); truss.dispose();
+  // ISS-like: core module + long truss + four large array wings.
+  const core = tintPart(new THREE.CylinderGeometry(0.004, 0.004, 0.014, 10).rotateZ(Math.PI / 2), 1.25);
+  const truss = tintPart(new THREE.BoxGeometry(0.034, 0.0012, 0.0018), 0.8);
+  const wings = [];
+  for (const [sx, sz] of [[-0.013, 0.006], [-0.013, -0.006], [0.013, 0.006], [0.013, -0.006]]) {
+    wings.push(tintPart(new THREE.BoxGeometry(0.012, 0.0006, 0.005).translate(sx, 0, sz), 0.5));
+  }
+  const geo = mergeGeometries([core, truss, ...wings]);
+  core.dispose(); truss.dispose(); wings.forEach((w) => w.dispose());
   return geo;
 }
 function buildNavGlyphGeometry() {
-  return new THREE.OctahedronGeometry(0.007, 0);
+  // GNSS bird: octahedral bus + two panel wings.
+  const bus = tintPart(new THREE.OctahedronGeometry(0.006, 0), 1.3);
+  const wL = tintPart(new THREE.BoxGeometry(0.012, 0.0006, 0.006).translate(-0.012, 0, 0), 0.5);
+  const wR = tintPart(new THREE.BoxGeometry(0.012, 0.0006, 0.006).translate(0.012, 0, 0), 0.5);
+  const geo = mergeGeometries([bus, wL, wR]);
+  bus.dispose(); wL.dispose(); wR.dispose();
+  return geo;
 }
 function buildDefaultGlyphGeometry() {
-  return new THREE.BoxGeometry(0.007, 0.007, 0.007);
+  return tintPart(new THREE.BoxGeometry(0.007, 0.007, 0.007), 1.0);
 }
 function buildGlyphGeometry(shape) {
   switch (shape) {
@@ -1175,10 +1213,13 @@ export class LunarScene {
     const colorHex = getCategoryColorHex(category);
     const mat = new THREE.MeshStandardMaterial({
       color: colorHex,
-      emissive: new THREE.Color(colorHex).multiplyScalar(0.18),
-      roughness: 0.55,
-      metalness: 0.45,
+      emissive: new THREE.Color(colorHex).multiplyScalar(0.22),
+      roughness: 0.4,
+      metalness: 0.65,
       flatShading: true,
+      // Per-component baked shading (bright bus / dark panels / foil) modulates
+      // the category hue for real depth and layering.
+      vertexColors: true,
     });
     const cap = Math.min(items.length, LOD_MAX_PER_CATEGORY);
     const mesh = new THREE.InstancedMesh(geo, mat, cap);
