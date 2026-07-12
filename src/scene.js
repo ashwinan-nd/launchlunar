@@ -1200,7 +1200,11 @@ export class LunarScene {
       this._lodNear = near;
       for (const [cat, points] of this._orbitalMeshes) {
         const hidden = this._userHidden.has(cat);
-        points.visible = !near && !hidden;
+        // Billboards stay visible at EVERY zoom level so no object ever
+        // disappears — including far-side and high-orbit (GEO) objects that
+        // the near instanced tier (5-unit cutoff) can't reach. The 3D glyphs
+        // are an ADDITIVE near-camera detail overlay, not a replacement.
+        points.visible = !hidden;
         const inst = this._instanced.get(cat);
         if (inst) inst.mesh.visible = near && !hidden;
       }
@@ -1452,8 +1456,8 @@ export class LunarScene {
       else this._userHidden.add(key);
 
       const mesh = this._orbitalMeshes.get(key);
-      // Points visible only in far mode; instanced glyphs only in near mode.
-      if (mesh) mesh.visible = visible && !this._lodNear;
+      // Billboards always visible (never disappear); 3D glyphs overlay when near.
+      if (mesh) mesh.visible = visible;
       const inst = this._instanced.get(key);
       if (inst) inst.mesh.visible = visible && this._lodNear;
     }
