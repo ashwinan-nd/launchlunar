@@ -1,26 +1,48 @@
-# LaunchLunar — BUILD COMPLETE
+# LaunchLunar — BUILD COMPLETE (consolidated)
 
-All 8 phases of the approved plan are implemented, verified, committed, and pushed.
+The `real-data-and-physics` and `overhaul` branches are merged into one
+comprehensive build on the `consolidation` branch. Everything below is
+implemented, tested, and browser-verified.
 
-- **Branch / commit:** `real-data-and-physics` @ `8a16a68` (pushed to origin, tree clean)
-- **Tests:** `npm test` → 13 passed, 0 failed (physics, ECI→Three handedness, full trajectory reaches Moon surface, ΔV budget, P(success), Monte-Carlo, catalog parse, SGP4 ≥95%).
+## What this build has
 
-## What was built
-- **Real data (Phase 1):** 31,788 real on-orbit objects from Space-Track GP catalog, real TLEs, SGP4 propagation in a worker, consolidated categorization (payload/debris/rocket-body/unknown).
-- **Real physics (Phase 2):** Lambert solver + coast-angle search + Newton differential corrector; RK4 waypoints; honors exact launch and Moon landing coords; J2 and handedness fixed. Apollo 11 → 14.9 km/s, 3.94 d, capture ~1736 km.
-- **Rendering (Phase 3):** per-category shaped glyphs, sized by RCS.
-- **Camera (Phase 4):** orbits Earth-core / rocket / moving Moon-core across the three views.
-- **Rocket + descent (Phase 5):** detailed `scene.createRocket` wired in.
-- **Windows (Phase 6):** Monte-Carlo P(success) with 98% threshold; conjunction screening + high-risk object highlighting.
-- **UI (Phase 7):** object info panel on click/search with real orbital readouts.
-- **Phase 8:** test suite, `.claude/skills/spacetrack-catalog` refresh skill, cleanup.
+**Real data**
+- ~31,000 real Space-Track objects, real TLEs, SGP4 propagation in a Web Worker.
+- Per-category glyphs sized by radar cross-section; live CelesTrak/N2YO fallback
+  with status toasts when the bundled catalog is unavailable.
+
+**Real physics** (all launch dates capture the Moon)
+- Gravity-turn ascent with real MECO + honest ascent-failure reporting.
+- Launch-azimuth plane targeting; Lambert TLI + Newton corrector; RK4 transfer
+  with J2 + lunar third-body gravity; periselene capture + powered descent to the
+  exact requested landing coordinate.
+- Uncached Moon-velocity finite differences (fixed a shared ~10x dvLoi bug).
+- Launch-window search with daily diversity, Monte-Carlo P(success), conjunction
+  screening.
+
+**Visualization + UX**
+- Photoreal Earth/Moon, selective bloom, GMST-accurate Earth orientation,
+  handedness-correct ECI→scene mapping.
+- Three camera views (EARTH / TRAJECTORY full-system framing / MOON) + phase-
+  budgeted, time-accurate playback with no jump cuts.
+- High-risk conjunctions glow red.
+- Floating neomorphic panels, responsive drawer/bottom-sheet layout (usable on a
+  390px phone — the 3D view was previously 0% visible on mobile), a11y labels +
+  focus rings.
+- N2YO key removed from source into .env (the committed key is burned in history
+  and must be rotated).
+
+## Tests (all green)
+- `npm test` — Vitest, 31 passed (ephemeris/GMST/handedness/RK4 conservation +
+  convergence/Hohmann/mission envelope/window diversity/data-layer mocks).
+- `npm run test:physics` — 13 passed (physics + catalog/SGP4 sanity).
+- `npm run test:e2e` — Playwright desktop 3 + mobile 2 passed.
 
 ## How to run
 ```
-cd C:\Users\ashanand\launchlunar
-npm run dev        # Vite → http://localhost:5173/
-npm test           # physics/data checks
-npm run fetch:catalog   # refresh Space-Track catalog (see spacetrack-catalog skill)
+npm install
+npm run dev        # Vite → http://localhost:5199/
+npm test           # unit + physics validation
+npm run test:e2e   # end-to-end (desktop + mobile)
 ```
-
-BUILD COMPLETE — email could not be sent from this environment, see DONE.md.
+See README.md for the full command list and architecture map.
