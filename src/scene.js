@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import gsap from 'gsap';
 import { SelectiveBloom, BLOOM_LAYER } from './postprocessing.js';
+import { computeGmst } from './orbital.js';
 
 // LOD: camera distance (Earth radii, camera-to-origin) below which the 3D
 // instanced glyph tier replaces the flat THREE.Points billboards. Kept below
@@ -23,7 +24,6 @@ const EARTH_RADIUS_KM = 6371;
 const MOON_RADIUS = 0.2727; // 1737.4 / 6371
 const MOON_DISTANCE = 60.3; // ~384400 / 6371
 const EARTH_SEGMENTS = 128;
-const EARTH_ROTATION_SPEED = 0.0001;
 const CLOUD_ROTATION_SPEED = 0.000035;
 const MOON_ORBIT_SPEED = 0.00005;
 const EARTH_AXIAL_TILT = 23.5 * (Math.PI / 180);
@@ -2076,21 +2076,34 @@ export class LunarScene {
   }
 
   focusTrajectory() {
-    // Orbit around the rocket; the per-frame follow keeps the target on it as it flies.
+    // Frame the WHOLE Earth-Moon system so the full transfer arc is visible.
+    // (The old versions either chased the rocket — hiding the arc — or used
+    // fixed multipliers that framed empty space at some Moon phases, so the
+    // button appeared to show nothing.) During playback the phase-based
+    // cinematography in main.js takes over; this is the static overview.
+    this._followRocket = false;
     this._followMoon = false;
-    if (this._rocket) {
-      this._followRocket = true;
-      const rp = this._rocket.position.clone();
-      const offset = new THREE.Vector3(0.6, 0.4, 0.6);
-      this._animateCameraTo(rp.clone().add(offset), rp, 1.5);
-    } else {
-      this._followRocket = false;
-      const moonPos = this.moon ? this.moon.position.clone() : new THREE.Vector3(MOON_DISTANCE, 0, 0);
-      const mid = moonPos.clone().multiplyScalar(0.45);
-      const totalDist = moonPos.length();
-      const camPos = new THREE.Vector3(mid.x, totalDist * 0.8, mid.z + totalDist * 0.3);
-      this._animateCameraTo(camPos, mid, 2.0);
-    }
+    const moonPos = this.moon ? this.moon.position.clone() : new THREE.Vector3(MOON_DISTANCE, 0, 0);
+    const mid = moonPos.clone().multiplyScalar(0.5);
+    const totalDist = moonPos.length();
+
+    // Required camera distance from the span's angular size vs the SMALLER of
+    // the vertical/horizontal FOV (aspect-dependent), plus a 30% margin.
+    const vFov = (this.camera.fov * Math.PI) / 180;
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
+    const limitingFov = Math.min(vFov, hFov);
+    const halfSpan = totalDist / 2;
+    const camDistance = (halfSpan * 1.3) / Math.tan(limitingFov / 2);
+
+    // View perpendicular to the Earth-Moon line, elevated so the arc's
+    // out-of-plane shape reads.
+    const spanDir = moonPos.clone().normalize();
+    let viewDir = new THREE.Vector3(0, 1, 0).cross(spanDir);
+    if (viewDir.lengthSq() < 1e-6) viewDir = new THREE.Vector3(0, 0, 1);
+    viewDir.normalize().multiplyScalar(camDistance);
+    viewDir.y += camDistance * 0.35;
+
+    this._animateCameraTo(mid.clone().add(viewDir), mid, 2.0);
   }
 
   followRocket() {
@@ -2235,15 +2248,21 @@ export class LunarScene {
     // Controls
     this.controls.update();
 
-    // Earth rotation — cosmetic spin, paused while a trajectory is displayed so the
-    // inertial ECI frame (frozen at launchDate) stays aligned with the beacon.
+    // Earth rotation from REAL sidereal time while idle: geographic longitude
+    // L sits at mesh-local angle -L (three.js sphere/texture convention) and
+    // the handedness-preserving eciToThreeJs mapping puts Greenwich at GMST —
+    // rotation.y = GMST lines the texture up with the ECI frame exactly, so
+    // satellites fly over the right geography. While a mission is selected the
+    // rotation is FROZEN at the launch epoch's GMST (freezeEarthRotationAt) so
+    // the inertial trajectory, beacon and Moon stay mutually consistent.
     if (this.earth && !this._freezeEarthRotation) {
-      this.earth.rotation.y += EARTH_ROTATION_SPEED * frameScale;
+      this.earth.rotation.y = computeGmst(new Date());
     }
 
-    // Cloud rotation (slightly different speed) — slow drift
+    // Clouds ride the Earth's rotation plus a slow eastward drift
     if (this.clouds) {
-      this.clouds.rotation.y += CLOUD_ROTATION_SPEED * frameScale;
+      this._cloudDrift = (this._cloudDrift || 0) + CLOUD_ROTATION_SPEED * frameScale;
+      this.clouds.rotation.y = (this.earth ? this.earth.rotation.y : 0) + this._cloudDrift;
     }
 
     // Moon orbit (simple circular for default; overridden by external moonPosition)

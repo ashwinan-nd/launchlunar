@@ -18,6 +18,7 @@ import {
   EARTH_RADIUS_KM,
 } from './orbital.js';
 import { fetchN2YOData } from './n2yo-fetcher.js';
+import { showToast } from './toast.js';
 import * as satellite from 'satellite.js';
 import gsap from 'gsap';
 
@@ -86,6 +87,7 @@ const WAYPOINT_PHASE_TO_MISSION = {
   tli_burn: 'tli',
   transfer: 'transfer',
   lunar_approach: 'loi',
+  lunar_orbit: 'loi',
   landing: 'landing',
 };
 
@@ -98,6 +100,64 @@ const REPROPAGATION_INTERVAL_MS = 5000;
 // Real catalog loader — full Space-Track GP catalog (public/data/catalog.json)
 // Each entry carries real TLE lines for genuine SGP4 propagation.
 // ---------------------------------------------------------------------------
+
+/**
+ * Live fallback when the bundled Space-Track catalog is unavailable: fetch
+ * CelesTrak GP groups (hardened queue w/ retry) + N2YO, and adapt them to the
+ * catalog entry shape { id, name, cat, rcs, l1, l2 } the pipeline expects.
+ * N2YO objects carry no TLEs and cannot be worker-propagated, so only
+ * TLE-bearing objects are returned.
+ */
+async function loadLiveFallbackCatalog() {
+  const out = [];
+  try {
+    const { objects, failures, usedFallback } = await fetchTLEData({ timeoutMs: 45000 });
+    if (failures && failures.length > 0) {
+      showToast({
+        title: 'CelesTrak partial data',
+        message: `${failures.length} group(s) failed (${failures.map((f) => f.group).join(', ')}).`,
+        level: 'warn',
+      });
+    }
+    if (usedFallback) {
+      showToast({
+        title: 'CelesTrak offline',
+        message: 'Using the bundled TLE snapshot (Dec 2024 epochs).',
+        level: 'error',
+        durationMs: 0,
+      });
+    }
+    const catMap = {
+      satellite: 'payload', starlink: 'payload', gps: 'payload', glonass: 'payload',
+      oneweb: 'payload', iridium: 'payload', weather: 'payload', iss: 'station',
+      station: 'station', debris: 'debris', rocket_body: 'rocket-body',
+      'rocket body': 'rocket-body', cubesat: 'payload',
+    };
+    for (const o of objects) {
+      if (!o.tle || !o.tle.line1 || !o.tle.line2) continue;
+      out.push({
+        id: String(o.id),
+        name: o.name,
+        cat: catMap[o.category] || 'unknown',
+        rcs: o.rcs || 'MEDIUM',
+        l1: o.tle.line1,
+        l2: o.tle.line2,
+      });
+    }
+  } catch (e) {
+    console.error('[data] live CelesTrak fallback failed:', e);
+  }
+  try {
+    const { failureSummary } = await fetchN2YOData(15000);
+    if (failureSummary) {
+      showToast({ title: 'N2YO degraded', message: failureSummary, level: 'warn' });
+    }
+  } catch (e) {
+    // N2YO is purely supplemental; a hard failure only merits a console note.
+    console.warn('[data] N2YO fallback failed:', e);
+  }
+  return out;
+}
 
 async function loadCatalog() {
   const resp = await fetch('/data/catalog.json');
@@ -192,9 +252,14 @@ function injectStyles() {
       display: flex;
       gap: 4px;
       align-items: center;
-      flex-wrap: wrap;
-      max-width: 600px;
+      /* Single scrollable row: 13+ category pills would wrap and overflow the
+         48px top bar. */
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      max-width: 46vw;
+      scrollbar-width: none;
     }
+    .sat-toggles::-webkit-scrollbar { display: none; }
     .sat-toggle {
       display: flex;
       align-items: center;
@@ -261,9 +326,9 @@ function injectStyles() {
     /* ===== LEFT SIDEBAR (rocket input form) ===== */
     .left-sidebar {
       position: absolute;
-      top: 48px;
-      left: 0;
-      bottom: 0;
+      top: 58px;
+      left: 10px;
+      bottom: 10px;
       width: 320px;
       z-index: 15;
       display: flex;
@@ -357,6 +422,7 @@ function injectStyles() {
     .sidebar-content {
       flex: 1;
       overflow-y: auto;
+      overflow-x: hidden;
       padding: 14px;
       transition: opacity 0.2s ease;
     }
@@ -542,9 +608,9 @@ function injectStyles() {
     /* ===== RIGHT SIDEBAR (results) ===== */
     .right-sidebar {
       position: absolute;
-      top: 48px;
-      right: 0;
-      bottom: 0;
+      top: 58px;
+      right: 10px;
+      bottom: 10px;
       width: 320px;
       z-index: 15;
       background: rgba(0,0,0,0.75);
@@ -553,7 +619,7 @@ function injectStyles() {
       border-left: 1px solid rgba(255,255,255,0.06);
       overflow-y: auto;
       padding: 14px;
-      transform: translateX(100%);
+      transform: translateX(calc(100% + 14px));
       transition: transform 0.35s ease;
     }
 
@@ -756,7 +822,7 @@ function injectStyles() {
     }
 
     .info-panel.shifted {
-      right: 332px;
+      right: 346px;
     }
 
     .info-panel-objects {
@@ -843,6 +909,81 @@ function injectStyles() {
       box-shadow: 0 0 24px rgba(0,224,255,0.08);
     }
     .left-sidebar.collapsed ~ .object-info { left: 64px; }
+
+    /* =====================================================================
+       RESPONSIVE LAYOUT
+       - ≤1024px: narrower panels
+       - ≤820px : left panel is an overlay drawer (collapse rail shows the
+                  3D view); launch windows become a bottom sheet; category
+                  pills + top bar scroll horizontally; compact play controls
+       - ≤480px : drawer takes (almost) full width when open
+       ===================================================================== */
+
+    .top-bar-center { min-width: 0; }
+
+    @media (max-width: 1024px) {
+      .left-sidebar { width: 280px; }
+      .right-sidebar { width: 280px; }
+      .info-panel.shifted { right: 306px; }
+    }
+
+    @media (max-width: 820px) {
+      .top-bar {
+        padding: 0 8px;
+        gap: 6px;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+      .top-bar::-webkit-scrollbar { display: none; }
+      .top-bar-logo { font-size: 0.7rem; letter-spacing: 0.08em; }
+      .top-bar-search { width: 80px; }
+      .top-bar-search:focus { width: 110px; }
+
+      .sat-toggles {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        max-width: 40vw;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+      }
+      .sat-toggles::-webkit-scrollbar { display: none; }
+
+      .left-sidebar {
+        width: 300px;
+        z-index: 25;
+      }
+      .left-sidebar.collapsed { width: 48px; }
+
+      .right-sidebar {
+        top: auto;
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+        width: auto;
+        height: 42vh;
+        transform: translateY(calc(100% + 14px));
+      }
+      .right-sidebar.visible { transform: translateY(0); }
+
+      .play-controls {
+        min-width: 0;
+        width: calc(100vw - 20px);
+        max-width: 420px;
+        padding: 10px 12px;
+        bottom: auto;
+        top: 58px;
+      }
+
+      .info-panel, .info-panel.shifted { right: 12px; bottom: 12px; }
+
+      .object-info { left: 10px !important; right: 10px; width: auto; }
+    }
+
+    @media (max-width: 480px) {
+      .left-sidebar { width: calc(100vw - 20px); }
+      .left-sidebar.collapsed { width: 48px; }
+      .right-sidebar { height: 48vh; }
+    }
   `;
   document.head.appendChild(style);
 }
@@ -954,6 +1095,7 @@ const state = {
   playAnimationId: null,
   lastPlayTimestamp: null,
   computedPhases: null,
+  missionTimeline: null, // display-progress ↔ mission-time mapping
 };
 
 // ---------------------------------------------------------------------------
@@ -984,28 +1126,28 @@ function buildLeftSidebar() {
         el('div', { className: 'form-section-title' }, 'Vehicle Specifications'),
         el('div', { className: 'form-grid' },
           el('div', { className: 'form-field full' },
-            el('label', null, 'Rocket Name'),
+            el('label', { for: 'f-rocket-name' }, 'Rocket Name'),
             el('input', { type: 'text', id: 'f-rocket-name', placeholder: 'e.g., Falcon 9, SLS' }),
           ),
           el('div', { className: 'form-field' },
-            el('label', null, 'Total Mass (kg)'),
-            el('input', { type: 'number', id: 'f-mass', placeholder: '549054' }),
+            el('label', { for: 'f-mass' }, 'Total Mass (kg)'),
+            el('input', { type: 'number', id: 'f-mass', placeholder: '549054', step: 'any' }),
           ),
           el('div', { className: 'form-field' },
-            el('label', null, 'Height (m)'),
-            el('input', { type: 'number', id: 'f-height', placeholder: '70' }),
+            el('label', { for: 'f-height' }, 'Height (m)'),
+            el('input', { type: 'number', id: 'f-height', placeholder: '70', step: 'any' }),
           ),
           el('div', { className: 'form-field' },
-            el('label', null, 'Max Thrust (kN)'),
-            el('input', { type: 'number', id: 'f-thrust', placeholder: '7607' }),
+            el('label', { for: 'f-thrust' }, 'Max Thrust (kN)'),
+            el('input', { type: 'number', id: 'f-thrust', placeholder: '7607', step: 'any' }),
           ),
           el('div', { className: 'form-field' },
-            el('label', null, 'Specific Impulse (s)'),
-            el('input', { type: 'number', id: 'f-isp', placeholder: '311' }),
+            el('label', { for: 'f-isp' }, 'Specific Impulse (s)'),
+            el('input', { type: 'number', id: 'f-isp', placeholder: '311', step: 'any' }),
           ),
           el('div', { className: 'form-field full' },
-            el('label', null, 'Payload Mass (kg)'),
-            el('input', { type: 'number', id: 'f-payload', placeholder: '22800' }),
+            el('label', { for: 'f-payload' }, 'Payload Mass (kg)'),
+            el('input', { type: 'number', id: 'f-payload', placeholder: '22800', step: 'any' }),
           ),
         ),
       ),
@@ -1015,7 +1157,7 @@ function buildLeftSidebar() {
         el('div', { className: 'form-section-title' }, 'Launch Parameters'),
         el('div', { className: 'form-grid single' },
           el('div', { className: 'form-field' },
-            el('label', null, 'Launch Site'),
+            el('label', { for: 'f-launch-site' }, 'Launch Site'),
             (() => {
               const select = el('select', { id: 'f-launch-site' });
               for (const site of LAUNCH_SITES) {
@@ -1029,11 +1171,11 @@ function buildLeftSidebar() {
         ),
         el('div', { className: 'custom-coords', id: 'custom-coords' },
           el('div', { className: 'form-field' },
-            el('label', null, 'Latitude'),
+            el('label', { for: 'f-custom-lat' }, 'Latitude'),
             el('input', { type: 'number', id: 'f-custom-lat', placeholder: '28.5729', step: '0.0001' }),
           ),
           el('div', { className: 'form-field' },
-            el('label', null, 'Longitude'),
+            el('label', { for: 'f-custom-lon' }, 'Longitude'),
             el('input', { type: 'number', id: 'f-custom-lon', placeholder: '-80.6490', step: '0.0001' }),
           ),
         ),
@@ -1044,11 +1186,11 @@ function buildLeftSidebar() {
         el('div', { className: 'form-section-title' }, 'Launch Window'),
         el('div', { className: 'form-grid' },
           el('div', { className: 'form-field' },
-            el('label', null, 'Start Month'),
+            el('label', { for: 'f-window-start' }, 'Start Month'),
             el('input', { type: 'month', id: 'f-window-start', value: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}` }),
           ),
           el('div', { className: 'form-field' },
-            el('label', null, 'End Month'),
+            el('label', { for: 'f-window-end' }, 'End Month'),
             el('input', { type: 'month', id: 'f-window-end', value: `${now.getFullYear()}-${String(now.getMonth() + 2).padStart(2, '0')}` }),
           ),
         ),
@@ -1059,7 +1201,7 @@ function buildLeftSidebar() {
         el('div', { className: 'form-section-title' }, 'Mission Target'),
         el('div', { className: 'form-grid single' },
           el('div', { className: 'form-field' },
-            el('label', null, 'Moon Target Region'),
+            el('label', { for: 'f-moon-target' }, 'Moon Target Region'),
             (() => {
               const select = el('select', { id: 'f-moon-target' });
               for (const t of MOON_TARGETS) {
@@ -1590,34 +1732,55 @@ function positionRocketAtProgress(progress) {
   if (!state.rocketMesh || !state.trajectoryVectors || state.trajectoryVectors.length < 2) return;
 
   const vectors = state.trajectoryVectors;
-  const t = Math.max(0, Math.min(1, progress));
-  const totalSegments = vectors.length - 1;
-  const segF = t * totalSegments;
-  const segIdx = Math.min(Math.floor(segF), totalSegments - 1);
-  const segT = segF - segIdx;
+  const p = Math.max(0, Math.min(1, progress));
 
-  const p0 = vectors[segIdx];
-  const p1 = vectors[Math.min(segIdx + 1, vectors.length - 1)];
+  // Map display progress → mission time → waypoint pair. Waypoints are
+  // wildly irregular in time (2 s apart during ascent, 600 s during
+  // transfer), so interpolating by INDEX distorts apparent speed by orders
+  // of magnitude and makes the rocket "jump". Interpolate by TIME.
+  let x, y, z, dirX, dirY, dirZ;
+  const tl = state.missionTimeline;
+  if (tl && tl.times.length === vectors.length) {
+    const missionMs = displayProgressToMissionMs(p);
+    const idx = findTimeIndex(tl.times, missionMs);
+    const i0 = Math.min(idx, vectors.length - 2);
+    const t0 = tl.times[i0];
+    const t1 = tl.times[i0 + 1];
+    const f = t1 > t0 ? Math.max(0, Math.min(1, (missionMs - t0) / (t1 - t0))) : 0;
 
-  const x = p0.x + (p1.x - p0.x) * segT;
-  const y = p0.y + (p1.y - p0.y) * segT;
-  const z = p0.z + (p1.z - p0.z) * segT;
+    const p0 = vectors[i0];
+    const p1 = vectors[i0 + 1];
+    x = p0.x + (p1.x - p0.x) * f;
+    y = p0.y + (p1.y - p0.y) * f;
+    z = p0.z + (p1.z - p0.z) * f;
+    dirX = p1.x - p0.x;
+    dirY = p1.y - p0.y;
+    dirZ = p1.z - p0.z;
+  } else {
+    // Fallback (no timeline): index interpolation
+    const totalSegments = vectors.length - 1;
+    const segF = p * totalSegments;
+    const segIdx = Math.min(Math.floor(segF), totalSegments - 1);
+    const segT = segF - segIdx;
+    const p0 = vectors[segIdx];
+    const p1 = vectors[Math.min(segIdx + 1, vectors.length - 1)];
+    x = p0.x + (p1.x - p0.x) * segT;
+    y = p0.y + (p1.y - p0.y) * segT;
+    z = p0.z + (p1.z - p0.z) * segT;
+    dirX = p1.x - p0.x;
+    dirY = p1.y - p0.y;
+    dirZ = p1.z - p0.z;
+  }
 
   state.rocketMesh.position.set(x, y, z);
   state.rocketMesh.visible = true;
 
-  const nextIdx = Math.min(segIdx + 2, vectors.length - 1);
-  const next = vectors[nextIdx];
-  const dx = next.x - x;
-  const dy = next.y - y;
-  const dz = next.z - z;
-  const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-  if (len > 0.0001) {
+  const len = Math.sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+  if (len > 1e-9) {
     const targetPos = state.rocketMesh.position.clone();
-    targetPos.x += dx / len;
-    targetPos.y += dy / len;
-    targetPos.z += dz / len;
+    targetPos.x += dirX / len;
+    targetPos.y += dirY / len;
+    targetPos.z += dirZ / len;
 
     const upCandidate = state.rocketMesh.position.clone().normalize();
     state.rocketMesh.up.copy(upCandidate);
@@ -1636,32 +1799,28 @@ function positionRocketAtProgress(progress) {
   }
 }
 
-function getCameraPositionForProgress(scene, progress) {
-  if (!state.trajectoryVectors || state.trajectoryVectors.length < 2) return null;
-  const rocketPos = state.rocketMesh ? state.rocketMesh.position : null;
-  if (!rocketPos) return null;
-
-  const phase = getCurrentPhase(progress);
-
-  if (phase.id === 'launch') {
+// Per-phase camera framing (anchor formulas). Selected by phase id; adjacent
+// phases are BLENDED near boundaries so the camera never jump-cuts.
+function cameraAnchorForPhase(phaseId, scene, rocketPos) {
+  if (phaseId === 'launch') {
     const offset = rocketPos.clone().normalize().multiplyScalar(0.15);
     const camPos = rocketPos.clone().add(offset);
     camPos.y += 0.1;
     return { position: camPos, target: rocketPos.clone() };
   }
-  if (phase.id === 'leo') {
+  if (phaseId === 'leo') {
     const offset = rocketPos.clone().normalize().multiplyScalar(0.8);
     const camPos = rocketPos.clone().add(offset);
     camPos.y += 0.3;
     return { position: camPos, target: rocketPos.clone() };
   }
-  if (phase.id === 'tli') {
+  if (phaseId === 'tli') {
     const offset = rocketPos.clone().normalize().multiplyScalar(1.5);
     offset.y += 1.0;
     return { position: rocketPos.clone().add(offset), target: rocketPos.clone() };
   }
-  if (phase.id === 'transfer') {
-    const earthPos = scene.earth ? scene.earth.position.clone() : rocketPos.clone();
+  if (phaseId === 'transfer') {
+    const earthPos = scene.earth ? scene.earth.getWorldPosition(new (rocketPos.constructor)()) : rocketPos.clone();
     const moonPos = scene.moon ? scene.moon.position.clone() : rocketPos.clone();
     const mid = earthPos.clone().add(moonPos).multiplyScalar(0.5);
     const totalDist = earthPos.distanceTo(moonPos);
@@ -1670,52 +1829,157 @@ function getCameraPositionForProgress(scene, progress) {
     camPos.z += totalDist * 0.2;
     return { position: camPos, target: rocketPos.clone() };
   }
-  if (phase.id === 'loi') {
+  if (phaseId === 'loi') {
     const moonPos = scene.moon ? scene.moon.position.clone() : rocketPos.clone();
     const toMoon = moonPos.clone().sub(rocketPos).normalize();
     const camPos = rocketPos.clone().sub(toMoon.multiplyScalar(2.0));
     camPos.y += 0.5;
     return { position: camPos, target: moonPos };
   }
-  if (phase.id === 'landing') {
+  if (phaseId === 'landing') {
     const moonPos = scene.moon ? scene.moon.position.clone() : rocketPos.clone();
     const fromMoon = rocketPos.clone().sub(moonPos).normalize();
     const camPos = rocketPos.clone().add(fromMoon.multiplyScalar(0.3));
     camPos.y += 0.15;
     return { position: camPos, target: rocketPos.clone() };
   }
-
   const offset = rocketPos.clone().normalize().multiplyScalar(1.0);
   return { position: rocketPos.clone().add(offset), target: rocketPos.clone() };
 }
 
+function getCameraPositionForProgress(scene, progress) {
+  if (!state.trajectoryVectors || state.trajectoryVectors.length < 2) return null;
+  const rocketPos = state.rocketMesh ? state.rocketMesh.position : null;
+  if (!rocketPos) return null;
+
+  const tl = state.missionTimeline;
+  if (!tl) {
+    return cameraAnchorForPhase(getCurrentPhase(progress).id, scene, rocketPos);
+  }
+
+  // Locate current display segment + local fraction
+  const seg = tl.segments.find(
+    (s) => progress >= s.displayStart && progress <= s.displayEnd
+  ) || tl.segments[tl.segments.length - 1];
+  const span = seg.displayEnd - seg.displayStart || 1;
+  const localFrac = (progress - seg.displayStart) / span;
+
+  const current = cameraAnchorForPhase(seg.id, scene, rocketPos);
+
+  // Blend from the previous phase's framing over the first 25% of each
+  // phase — a continuous camera move instead of a hard cut at the boundary.
+  const segIdx = tl.segments.indexOf(seg);
+  if (segIdx > 0 && localFrac < 0.25) {
+    const prev = cameraAnchorForPhase(tl.segments[segIdx - 1].id, scene, rocketPos);
+    const w = localFrac / 0.25;
+    const smooth = w * w * (3 - 2 * w); // smoothstep
+    current.position.lerpVectors(prev.position, current.position, smooth);
+    current.target.lerpVectors(prev.target, current.target, smooth);
+  }
+
+  return current;
+}
+
 // ---------------------------------------------------------------------------
-// Phase computation
+// Mission timeline — display-progress ↔ mission-time mapping
 // ---------------------------------------------------------------------------
+// Each mission phase gets a FIXED share of the playback (display budget), and
+// within a phase the animation runs proportionally through that phase's real
+// mission time. Without this, the 8-minute ascent is over in a blink while
+// waypoint-dense stretches crawl.
+
+const PHASE_DISPLAY_BUDGETS = {
+  launch: 0.15,
+  leo: 0.10,
+  tli: 0.10,
+  transfer: 0.45,
+  loi: 0.10,
+  landing: 0.10,
+};
 
 function computePhaseFractions(windowData) {
   const waypoints = windowData.trajectory.waypoints;
   if (!waypoints || waypoints.length < 2) {
+    state.missionTimeline = null;
     state.computedPhases = null;
     return;
   }
 
-  const total = waypoints.length;
-  const phaseStartIndices = {};
+  const times = waypoints.map((wp) => wp.time.getTime());
 
-  for (let i = 0; i < total; i++) {
-    const wpPhase = waypoints[i].phase;
-    const missionId = WAYPOINT_PHASE_TO_MISSION[wpPhase] || wpPhase;
-    if (!(missionId in phaseStartIndices)) {
-      phaseStartIndices[missionId] = i;
-    }
+  // First waypoint index of each mission phase, in encounter order
+  const phaseFirstIndex = new Map();
+  for (let i = 0; i < waypoints.length; i++) {
+    const missionId = WAYPOINT_PHASE_TO_MISSION[waypoints[i].phase] || waypoints[i].phase;
+    if (!phaseFirstIndex.has(missionId)) phaseFirstIndex.set(missionId, i);
   }
 
-  state.computedPhases = MISSION_PHASES.map((mp) => {
-    const startIdx = phaseStartIndices[mp.id];
-    const fraction = startIdx !== undefined ? startIdx / (total - 1) : mp.fraction;
-    return { id: mp.id, label: mp.label, fraction };
-  });
+  // Build segments for the phases actually present, ordered by MISSION_PHASES
+  const present = MISSION_PHASES.filter((mp) => phaseFirstIndex.has(mp.id));
+  if (present.length === 0) {
+    state.missionTimeline = null;
+    state.computedPhases = null;
+    return;
+  }
+
+  // Renormalize budgets over the present phases
+  const budgetSum = present.reduce((s, mp) => s + (PHASE_DISPLAY_BUDGETS[mp.id] || 0.1), 0);
+
+  const segments = [];
+  let displayCursor = 0;
+  for (let k = 0; k < present.length; k++) {
+    const mp = present[k];
+    const startIdx = phaseFirstIndex.get(mp.id);
+    const endIdx = k + 1 < present.length
+      ? phaseFirstIndex.get(present[k + 1].id)
+      : waypoints.length - 1;
+    const budget = (PHASE_DISPLAY_BUDGETS[mp.id] || 0.1) / budgetSum;
+    segments.push({
+      id: mp.id,
+      label: mp.label,
+      displayStart: displayCursor,
+      displayEnd: displayCursor + budget,
+      timeStart: times[startIdx],
+      timeEnd: times[Math.max(endIdx, startIdx + 1)] ?? times[times.length - 1],
+    });
+    displayCursor += budget;
+  }
+  // Snap the final boundary to exactly 1.0
+  segments[segments.length - 1].displayEnd = 1.0;
+  segments[segments.length - 1].timeEnd = times[times.length - 1];
+
+  state.missionTimeline = { times, segments };
+  state.computedPhases = segments.map((s) => ({
+    id: s.id,
+    label: s.label,
+    fraction: s.displayStart,
+  }));
+}
+
+function displayProgressToMissionMs(progress) {
+  const tl = state.missionTimeline;
+  if (!tl) return 0;
+  const p = Math.max(0, Math.min(1, progress));
+  for (const s of tl.segments) {
+    if (p <= s.displayEnd || s === tl.segments[tl.segments.length - 1]) {
+      const span = s.displayEnd - s.displayStart || 1;
+      const f = Math.max(0, Math.min(1, (p - s.displayStart) / span));
+      return s.timeStart + f * (s.timeEnd - s.timeStart);
+    }
+  }
+  return tl.times[tl.times.length - 1];
+}
+
+/** Binary search: greatest index i with times[i] <= t (clamped to len-2). */
+function findTimeIndex(times, t) {
+  let lo = 0;
+  let hi = times.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (times[mid] <= t) lo = mid;
+    else hi = mid - 1;
+  }
+  return Math.min(lo, times.length - 2);
 }
 
 function getCurrentPhase(progress) {
@@ -1841,7 +2105,10 @@ function playAnimationFrame() {
   const deltaMs = now - state.lastPlayTimestamp;
   state.lastPlayTimestamp = now;
 
-  const baseDuration = 30000;
+  // 75 s baseline playback at 1×; per-phase display budgets inside
+  // (see PHASE_DISPLAY_BUDGETS) so the ascent is watchable and the
+  // multi-day transfer doesn't crawl.
+  const baseDuration = 75000;
   const increment = (deltaMs / baseDuration) * state.playSpeed;
   state.playProgress = Math.min(1.0, state.playProgress + increment);
 
@@ -1854,7 +2121,9 @@ function playAnimationFrame() {
     if (cam) {
       const camera = state.scene.camera;
       const controls = state.scene.controls;
-      const lerpFactor = 0.03;
+      // Anchor targets are already phase-blended (no cuts); this per-frame
+      // lerp only adds damping on top.
+      const lerpFactor = 0.07;
       camera.position.lerp(cam.position, lerpFactor);
       controls.target.lerp(cam.target, lerpFactor);
     }
@@ -2000,12 +2269,30 @@ async function loadInitialOrbitalData() {
   const now = new Date();
 
   // Load the full real Space-Track catalog (every entry has real TLE lines).
+  // If it is missing/corrupt (fresh clone without running fetch:catalog),
+  // fall back to LIVE CelesTrak + N2YO fetches so the app still works —
+  // degraded but honest, with a toast explaining what happened.
   let catalog;
   try {
     catalog = await loadCatalog();
   } catch (e) {
     console.error('[data] catalog load failed:', e);
-    return;
+    showToast({
+      title: 'Catalog unavailable',
+      message: 'public/data/catalog.json failed to load — falling back to live CelesTrak/N2YO data. Run `npm run fetch:catalog` for the full Space-Track catalog.',
+      level: 'error',
+      durationMs: 0,
+    });
+    catalog = await loadLiveFallbackCatalog();
+    if (catalog.length === 0) {
+      showToast({
+        title: 'No orbital data',
+        message: 'All data sources failed. The scene will show Earth and Moon only.',
+        level: 'error',
+        durationMs: 0,
+      });
+      return;
+    }
   }
   state.catalog = catalog;
   state.orbitalData = catalog; // reused by the launch pipeline for conjunction screening
@@ -2174,17 +2461,28 @@ async function handleLaunch() {
     showSidebarLoading('Finding optimal launch windows...', 40);
     await new Promise((r) => setTimeout(r, 30));
 
+    // Never offer launch dates in the past: clamp the window start to now.
+    const nowDate = new Date();
+    const searchStart = values.windowStart > nowDate ? values.windowStart : nowDate;
+    if (values.windowEnd <= searchStart) {
+      errorEl.textContent = 'Launch window is entirely in the past.';
+      launchBtn.disabled = false;
+      hideSidebarLoading();
+      return;
+    }
+
     let windows;
     try {
       windows = await findOptimalLaunchWindows(
         launchSite,
-        values.windowStart,
+        searchStart,
         values.windowEnd,
         rocketParams,
         tleDataForWindows,
         5,
-        (progress, message) => {
-          const pct = 40 + progress * 50;
+        // Progress callback receives a single { phase, progress, message }
+        ({ progress, message } = {}) => {
+          const pct = 40 + (progress || 0) * 50;
           showSidebarLoading(message || 'Computing trajectories...', pct);
         },
         moonTargetCoords
@@ -2230,55 +2528,12 @@ async function handleLaunch() {
     if (windows.length > 0) {
       renderResultsPanel(windows, values);
 
-      // Auto-select first window
-      state.selectedWindowIndex = 0;
-      const w = windows[0];
-
-      computePhaseFractions(w);
-
-      // Move the Moon to the ARRIVAL position and freeze the Earth spin BEFORE drawing
-      // the trajectory so Moon mesh + landing marker + trajectory end + beacon coincide.
-      const moonPosThree = eciToThreeJs(w.moonArrivalPosition);
-      state.scene.setMoonPosition(moonPosThree);
-      state.scene.freezeEarthRotationAt(computeGmst(w.launchDate));
-
-      const trajPoints = w.trajectory.waypoints.map((wp) => eciToThreeJs(wp.position));
-      state.scene.showTrajectory(trajPoints, 0xff0000);
-      addTrajectoryTickMarks(state.scene, w);
-      buildTrajectoryCurve(state.scene, trajPoints);
-      createRocketMesh(state.scene);
-      positionRocketAtProgress(0);
-      showWindowRisks(state.scene, w);
-
-      // Show markers
-      const landingLatRad = (w.landingSite.lat || 0) * (Math.PI / 180);
-      const landingLonRad = (w.landingSite.lon || 0) * (Math.PI / 180);
-      const moonRadiusThree = 1737.4 / EARTH_RADIUS_KM;
-      const localX = moonRadiusThree * Math.cos(landingLatRad) * Math.cos(landingLonRad);
-      const localY = moonRadiusThree * Math.sin(landingLatRad);
-      const localZ = moonRadiusThree * Math.cos(landingLatRad) * Math.sin(landingLonRad);
-      state.scene.showLandingSite({
-        x: moonPosThree.x + localX,
-        y: moonPosThree.y + localY,
-        z: moonPosThree.z + localZ,
-      });
-
-      // True ECI launch surface point (physics start), not texture lat/lon.
-      const earthSurfacePos = eciToThreeJs(w.trajectory.waypoints[0].position);
-      state.scene.showLaunchSite({
-        x: earthSurfacePos.x,
-        y: earthSurfacePos.y,
-        z: earthSurfacePos.z,
-      });
-
-      // Show play controls
-      document.getElementById('play-controls').classList.add('visible');
-
-      // Initialize play controls
+      // Initialize play controls, then select the first window through the SAME
+      // code path a user click takes (selectWindow). A duplicated inline copy of
+      // this logic here is how stale marker code and missing state
+      // (trajectoryPoints, phase status) crept in.
       initPlayControls();
-
-      state.scene.focusEarth();
-      setActiveViewButton('earth');
+      selectWindow(0, windows, values);
     } else {
       const panel = document.getElementById('right-sidebar');
       panel.innerHTML = '';
@@ -2354,6 +2609,13 @@ function init() {
     state.sidebarCollapsed = false;
     document.getElementById('left-sidebar').classList.remove('collapsed');
   });
+
+  // Small screens: start with the form collapsed to a rail so the 3D view
+  // (the app's core content) is visible first.
+  if (window.innerWidth <= 820) {
+    state.sidebarCollapsed = true;
+    document.getElementById('left-sidebar').classList.add('collapsed');
+  }
 
   // Custom coordinates toggle
   document.getElementById('f-launch-site').addEventListener('change', (e) => {
@@ -2444,6 +2706,10 @@ function init() {
 
 // Expose state for verification/debugging.
 window.__state = state;
+
+// Dev/test hook: programmatic access to app state for e2e tests and
+// geometry verification (marker positions, timeline, scene internals).
+window.__lunar = { state, eciToThreeJs, getMoonPosition };
 
 // Boot
 init();
