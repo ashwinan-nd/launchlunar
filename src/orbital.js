@@ -236,6 +236,41 @@ function getMoonPositionCached(date) {
   return result;
 }
 
+// Sun's gravitational parameter (km³/s²) — for solar third-body perturbation.
+export const SUN_MU = 1.32712440018e11;
+
+const _sunPosCache = new Map();
+const SUN_CACHE_RESOLUTION_MS = 3600000; // 1-hour resolution is plenty for the Sun
+
+/**
+ * Geocentric equatorial (ECI) Sun position in km — low-precision solar
+ * ephemeris (Meeus, Astronomical Algorithms Ch. 25). Good to ~0.01°, ample for
+ * a third-body perturbation on a multi-day trans-lunar coast.
+ * @param {Date} date
+ * @returns {{x:number, y:number, z:number}}
+ */
+export function getSunPosition(date) {
+  const n = julianDate(date) - 2451545.0;         // days since J2000
+  const L = normalizeAngle(280.460 + 0.9856474 * n) * DEG_TO_RAD; // mean longitude
+  const g = normalizeAngle(357.528 + 0.9856003 * n) * DEG_TO_RAD; // mean anomaly
+  const lambda = L + (1.915 * Math.sin(g) + 0.020 * Math.sin(2 * g)) * DEG_TO_RAD; // ecliptic lon
+  const eps = (23.439 - 0.0000004 * n) * DEG_TO_RAD;             // obliquity
+  const R = (1.00014 - 0.01671 * Math.cos(g) - 0.00014 * Math.cos(2 * g)) * AU_KM; // km
+  return {
+    x: R * Math.cos(lambda),
+    y: R * Math.cos(eps) * Math.sin(lambda),
+    z: R * Math.sin(eps) * Math.sin(lambda),
+  };
+}
+
+function getSunPositionCached(date) {
+  const key = Math.floor(date.getTime() / SUN_CACHE_RESOLUTION_MS);
+  if (_sunPosCache.has(key)) return _sunPosCache.get(key);
+  const result = getSunPosition(date);
+  _sunPosCache.set(key, result);
+  return result;
+}
+
 /**
  * Moon velocity (km/s) by central finite difference on the UNCACHED ephemeris.
  * Never use cached positions for finite differences: the 10-minute cache
@@ -707,6 +742,7 @@ export function calculateTranslunarTrajectory(
     thrustN = 7600000,
     specificImpulseS = 311,
     payload = 50000,
+    heightM = 70,
   } = rocketParams || {};
 
   const waypoints = [];
@@ -791,6 +827,24 @@ export function calculateTranslunarTrajectory(
   let burnedOut = false;
   let engineCutoff = false; // MECO: ballistic apoapsis has reached LEO target
 
+  // Aerodynamic drag (MIT 16.unified ascent ODE: V̇ = −g − ½ρV|V|·CdA/m + …).
+  // Exponential atmosphere; drag acts on velocity relative to the co-rotating
+  // air. Frontal area from the vehicle's height via a typical fineness ratio
+  // (~1:20 slenderness), floored so a nose-only value can't zero the drag.
+  const RHO0_KG_M3 = 1.225;       // sea-level density
+  const SCALE_HEIGHT_KM = 8.5;    // exponential atmosphere scale height
+  const DRAG_CD = 0.30;           // slender launch-vehicle drag coefficient
+  const DRAG_TOP_ALT_KM = 120;    // above the Kármán-ish line drag is negligible
+  const vehRadiusM = Math.max(1.5, (heightM || 70) / 20);
+  const frontalAreaM2 = Math.PI * vehRadiusM * vehRadiusM;
+
+  // Physically-grounded ascent losses accumulated FROM the integration
+  // (gravity loss ∫g·sinγ dt + drag loss ∫a_drag dt), replacing the old flat
+  // 1.8 km/s constant so the reported LEO ΔV varies honestly with the vehicle
+  // and its trajectory.
+  let gravityLossKmS = 0;
+  let dragLossKmS = 0;
+
   while (true) {
     const r = vecMag(pos);
     const altKm = r - rEarth;
@@ -854,7 +908,28 @@ export function calculateTranslunarTrajectory(
 
     const thrustAccel = vecScale(thrustDir, thrustAccelMag);
     const gravAccel = vecScale(rHat, -gLocal);
-    const totalAccel = vecAdd(thrustAccel, gravAccel);
+
+    // Aerodynamic drag on the atmosphere-relative velocity (co-rotating air).
+    let dragAccel = { x: 0, y: 0, z: 0 };
+    let dragAccelMag = 0;
+    if (altKm < DRAG_TOP_ALT_KM) {
+      const vRel = vecSub(vel, vecCross(omegaEarth, pos)); // km/s
+      const vRelMag = vecMag(vRel);
+      if (vRelMag > 1e-6) {
+        const rho = RHO0_KG_M3 * Math.exp(-Math.max(0, altKm) / SCALE_HEIGHT_KM); // kg/m³
+        const vMs = vRelMag * 1000; // m/s
+        // a = ½ρv²·Cd·A/m  [m/s²]  →  km/s²  (×1e-3)
+        dragAccelMag = 0.5 * rho * vMs * vMs * DRAG_CD * frontalAreaM2 / currentMass * 1e-3;
+        dragAccel = vecScale(vRel, -dragAccelMag / vRelMag);
+      }
+    }
+
+    const totalAccel = vecAdd(vecAdd(thrustAccel, gravAccel), dragAccel);
+
+    // Accumulate physical ascent losses along the path.
+    const sinGamma = vMag > 1e-6 ? Math.max(0, vDotR / vMag) : 1;
+    gravityLossKmS += gLocal * sinGamma * ascentDt;
+    dragLossKmS += dragAccelMag * ascentDt;
 
     const accelFnAscent = () => totalAccel;
     const step = rk4Step(pos, vel, tElapsed, ascentDt, accelFnAscent);
@@ -925,11 +1000,14 @@ export function calculateTranslunarTrajectory(
   const vCircDir = vecNormalize(vecCross(hHat, rHatLeo)); // prograde direction
   vel = vecScale(vCircDir, vCircAtLeo);
 
-  // Delta-V to LEO: ideal orbital speed gain minus the free launch-site rotation
-  // speed, plus a realistic gravity+drag+steering loss budget (~1.8 km/s).
+  // Delta-V to LEO: ideal orbital speed gain minus the free launch-site
+  // rotation speed, plus the gravity + drag losses INTEGRATED along the ascent
+  // (MIT ascent ODE), plus a small steering/misc allowance. Physically grounded
+  // and vehicle-dependent rather than a flat constant.
   const surfaceSpeed = vecMag(vecCross(omegaEarth, launchPosEci));
-  const ASCENT_LOSSES = 1.8; // km/s, typical gravity+drag+steering losses
-  const dvLeo = Math.max(0, vCircAtLeo - surfaceSpeed) + ASCENT_LOSSES;
+  const STEERING_LOSS_KMS = 0.15; // small residual (cosine/steering) allowance
+  const ascentLosses = gravityLossKmS + dragLossKmS + STEERING_LOSS_KMS;
+  const dvLeo = Math.max(0, vCircAtLeo - surfaceSpeed) + ascentLosses;
 
   // ────────────────────────────────────────────────────────────────────────────
   // Phase 2: LEO Coast - circular orbit at ~200 km
@@ -1183,10 +1261,23 @@ export function calculateTranslunarTrajectory(
     const ayMoon = MOON_MU * (scToMoon.y / moonDist3 - moonPosVec.y / moonR3);
     const azMoon = MOON_MU * (scToMoon.z / moonDist3 - moonPosVec.z / moonR3);
 
+    // Sun third-body perturbation (same direct + indirect form). Small — a few
+    // ×10⁻⁶ km/s² — but it accumulates over a multi-day coast and is standard
+    // in real trans-lunar targeting.
+    const sunPos = getSunPositionCached(dateAddSeconds(launchDate, t));
+    const scToSun = vecSub(sunPos, p);
+    const sunDist = vecMag(scToSun);
+    const sunDist3 = sunDist * sunDist * sunDist;
+    const sunR = vecMag(sunPos);
+    const sunR3 = sunR * sunR * sunR;
+    const axSun = SUN_MU * (scToSun.x / sunDist3 - sunPos.x / sunR3);
+    const aySun = SUN_MU * (scToSun.y / sunDist3 - sunPos.y / sunR3);
+    const azSun = SUN_MU * (scToSun.z / sunDist3 - sunPos.z / sunR3);
+
     return {
-      x: axEarth + axMoon,
-      y: ayEarth + ayMoon,
-      z: azEarth + azMoon,
+      x: axEarth + axMoon + axSun,
+      y: ayEarth + ayMoon + aySun,
+      z: azEarth + azMoon + azSun,
     };
   }
 
@@ -2324,6 +2415,60 @@ export function screenConjunctions(waypoints, tleData, launchDate) {
   return out.slice(0, 15);
 }
 
+// ─── 7b. Launch Collision Avoidance (COLA) probability ──────────────────────────
+
+/** Max screening position uncertainty (1σ, km) used for the COLA Pc. */
+export const COLA_SIGMA_KM = 0.5;
+/** COLA blackout threshold — launch times whose max Pc exceeds this are closed. */
+export const COLA_PC_THRESHOLD = 1e-4;
+
+/**
+ * Leading-order collision probability for a 2-D circular-Gaussian encounter
+ * (Chan/Foster small-hard-body approximation), the standard closed form used
+ * in launch COLA screening: Pc ≈ (R²/2σ²)·exp(−d²/2σ²).
+ * @param {number} missKm   miss distance (km)
+ * @param {number} hbrKm    combined hard-body radius (km)
+ * @param {number} [sigmaKm] combined 1σ position uncertainty (km)
+ * @returns {number} collision probability in [0,1]
+ */
+export function collisionProbability(missKm, hbrKm, sigmaKm = COLA_SIGMA_KM) {
+  const s2 = sigmaKm * sigmaKm;
+  if (s2 <= 0) return missKm <= hbrKm ? 1 : 0;
+  const pc = (hbrKm * hbrKm / (2 * s2)) * Math.exp(-(missKm * missKm) / (2 * s2));
+  return Math.max(0, Math.min(1, pc));
+}
+
+/** Combined hard-body radius (km): object radius by RCS class + ~5 m vehicle. */
+export function hardBodyRadiusKm(rcs) {
+  const objM = rcs === 'LARGE' ? 5 : rcs === 'MEDIUM' ? 1 : 0.2;
+  return (objM + 5) / 1000;
+}
+
+/**
+ * Fold a window's screened conjunctions into a single COLA assessment: the
+ * worst-case collision probability across all close approaches, the worst miss
+ * distance, and whether the window should be BLACKED OUT (Pc over threshold),
+ * exactly as a real launch COLA analysis closes unsafe launch times.
+ * @param {Array} closeApproaches  output of screenConjunctions()
+ * @returns {{maxPc:number, worstMissKm:number, screenedCount:number, blocked:boolean}}
+ */
+export function assessCola(closeApproaches) {
+  let maxPc = 0;
+  let worstMissKm = Infinity;
+  for (const a of closeApproaches) {
+    const pc = collisionProbability(a.distanceKm, hardBodyRadiusKm(a.rcs));
+    if (pc > maxPc) maxPc = pc;
+    if (a.distanceKm < worstMissKm) worstMissKm = a.distanceKm;
+  }
+  if (!isFinite(worstMissKm)) worstMissKm = Infinity;
+  return {
+    maxPc,
+    worstMissKm,
+    screenedCount: closeApproaches.length,
+    blocked: maxPc > COLA_PC_THRESHOLD,
+  };
+}
+
 // ─── 8. Find Optimal Launch Windows ─────────────────────────────────────────────
 
 /**
@@ -2791,14 +2936,22 @@ export async function findOptimalLaunchWindows(
 
       const feasible = realTrajectory.transferResult !== 'miss' &&
                        realTrajectory.transferResult !== 'escaped';
-      // Monte-Carlo trans-lunar success × conjunction safety.
-      const mc = feasible ? monteCarloSuccess(realTrajectory.tliState, entry.launchDate, 32) : 0;
-      const critical = closeApproaches.filter((a) => a.severity === 'critical').length;
-      const warning = closeApproaches.filter((a) => a.severity === 'warning').length;
-      const conjSafety = Math.max(0, 1 - critical * 0.25 - warning * 0.06);
-      const pSuccess = Math.max(0, Math.min(0.999, mc * conjSafety));
 
-      const collisionScore = 1 / (1 + closeApproaches.length * 2);
+      // ── COLA: real launch collision-avoidance assessment ──
+      // Predicted catalog positions at THIS candidate's launch epoch (already
+      // used by screenConjunctions) → worst-case collision probability. Windows
+      // over the Pc threshold are BLACKED OUT (a real COLA closes those launch
+      // times); the assessment is also folded into P(success).
+      const cola = assessCola(closeApproaches);
+      const colaSafety = cola.blocked
+        ? 0.05                                        // blacked-out launch time
+        : Math.max(0.2, 1 - cola.maxPc / COLA_PC_THRESHOLD * 0.8);
+
+      // Monte-Carlo trans-lunar success × COLA safety.
+      const mc = feasible ? monteCarloSuccess(realTrajectory.tliState, entry.launchDate, 32) : 0;
+      const pSuccess = Math.max(0, Math.min(0.999, mc * colaSafety));
+
+      const collisionScore = cola.blocked ? 0 : (1 - cola.maxPc / COLA_PC_THRESHOLD);
       const updatedScore =
         entry.scoring.dvScore * 0.25 +
         collisionScore * 0.20 +
@@ -2813,10 +2966,16 @@ export async function findOptimalLaunchWindows(
         closeApproaches,
         deltaV: realTrajectory.deltaV,
         flightDuration: realTrajectory.flightDuration,
+        flightDays: realTrajectory.flightDuration / SECONDS_PER_DAY,
         moonArrivalPosition: moonAtArrival,
         landingSite,
         feasible,
         pSuccess,
+        // COLA readouts surfaced to the UI
+        maxPc: cola.maxPc,
+        worstMissKm: cola.worstMissKm,
+        screenedCount: cola.screenedCount,
+        colaBlocked: cola.blocked,
         score: updatedScore,
         scoring: { ...entry.scoring, collisionScore },
       };
@@ -2834,6 +2993,21 @@ export async function findOptimalLaunchWindows(
 
   // Order windows by P(success) (then score) — Monte-Carlo refines this in Phase 6.
   feasibleWindows.sort((a, b) => (b.pSuccess - a.pSuccess) || (b.score - a.score));
+
+  // ── Pareto tags (NASA Trajectory Browser style ΔV / flight-time trade) ──
+  // Flag the minimum-ΔV and minimum-flight-time windows so the UI can present
+  // the trade explicitly rather than a single opaque ranking.
+  if (feasibleWindows.length > 0) {
+    let dvOpt = feasibleWindows[0], timeOpt = feasibleWindows[0];
+    for (const w of feasibleWindows) {
+      if (w.deltaV.total < dvOpt.deltaV.total) dvOpt = w;
+      if (w.flightDuration < timeOpt.flightDuration) timeOpt = w;
+    }
+    for (const w of feasibleWindows) {
+      w.paretoDvOptimal = w === dvOpt;
+      w.paretoTimeOptimal = w === timeOpt;
+    }
+  }
 
   notify({ phase: 'complete', progress: 1, message: 'Launch window search complete' });
 

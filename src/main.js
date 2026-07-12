@@ -1425,11 +1425,31 @@ function renderResultsPanel(windows, formValues) {
     const pSucc = ((w.pSuccess ?? 0) * 100).toFixed(1);
     const pColor = (w.pSuccess ?? 0) >= 0.98 ? '#00e08a' : (w.pSuccess ?? 0) >= 0.9 ? '#ffcc44' : '#ff6b6b';
     const critical = (w.closeApproaches || []).filter((a) => a.severity === 'critical' || a.severity === 'warning').length;
+
+    // COLA readout: worst-case collision probability + blackout flag.
+    const maxPc = w.maxPc ?? 0;
+    const colaText = maxPc > 0 ? maxPc.toExponential(1) : '<1e-9';
+    const colaColor = w.colaBlocked ? '#ff5d5d' : maxPc > 1e-5 ? '#ffcc44' : '#8899aa';
+
+    // Pareto trade + COLA badges.
+    const badges = [];
+    if (w.paretoDvOptimal) badges.push(['ΔV-OPT', '#4da3ff']);
+    if (w.paretoTimeOptimal) badges.push(['FASTEST', '#c084fc']);
+    if (w.colaBlocked) badges.push(['COLA BLOCKED', '#ff5d5d']);
+
     const card = el('div', {
       className: `window-card${idx === 0 ? ' selected' : ''}`,
       id: `window-card-${idx}`,
     },
-      el('div', { className: 'window-card-rank' }, `#${idx + 1}`),
+      el('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
+        el('span', { className: 'window-card-rank' }, `#${idx + 1}`),
+        ...badges.map(([txt, c]) => el('span', {
+          style: {
+            fontSize: '0.56rem', fontWeight: '700', letterSpacing: '0.06em',
+            color: c, border: `1px solid ${c}`, borderRadius: '4px', padding: '1px 5px',
+          },
+        }, txt)),
+      ),
       el('div', { className: 'window-card-date' }, formatDateTime(w.launchDate)),
       el('div', { style: { fontSize: '0.95rem', fontWeight: '700', color: pColor, margin: '2px 0 6px' } },
         `P(success): ${pSucc}%`),
@@ -1438,6 +1458,10 @@ function renderResultsPanel(windows, formValues) {
         el('span', null, el('span', { className: 'stat-label' }, 'Flight: '), `${flightDays} days`),
         el('span', null, el('span', { className: 'stat-label' }, 'High-risk: '), `${critical} objects`),
         el('span', null, el('span', { className: 'stat-label' }, 'Screened: '), `${w.closeApproaches.length}`),
+        el('span', { style: { gridColumn: '1 / -1', color: colaColor } },
+          el('span', { className: 'stat-label' }, 'COLA max Pc: '),
+          colaText,
+        ),
         el('span', { style: { gridColumn: '1 / -1' } },
           el('span', { className: 'stat-label' }, 'Landing: '),
           craterLabel(w),
