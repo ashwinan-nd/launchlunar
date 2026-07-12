@@ -352,10 +352,16 @@ function createEarthShaderMaterial(dayTex, nightTex, normalTex, specularTex, clo
         // Subtle vegetation boost
         dayColor.g *= 1.08;
 
-        // Night lights glow in dark areas
-        vec3 nightGlow = nightColor * 1.5;
+        // Night side = a strong "earthshine" of the real surface texture PLUS
+        // city lights. Keeping the night hemisphere at a detailed ~28% of the
+        // day texture (very slightly cool-tinted) means the whole globe always
+        // reads as a solid, detailed planet from every angle instead of a
+        // near-black void that looks transparent against space.
+        vec3 earthshine = dayColor * vec3(0.24, 0.26, 0.30);
+        vec3 nightLights = nightColor * 1.6;
+        vec3 nightSide = earthshine + nightLights;
 
-        vec3 color = mix(nightGlow, dayColor, dayFactor);
+        vec3 color = mix(nightSide, dayColor, dayFactor);
 
         // --- Ocean specular gated by the specular (ocean) mask ---
         if (hasSpecular > 0.5) {
@@ -374,8 +380,9 @@ function createEarthShaderMaterial(dayTex, nightTex, normalTex, specularTex, clo
           color *= (1.0 - 0.35 * cloudShadow * dayFactor);
         }
 
-        // Faint ambient fill so the night side isn't pure black
-        color += dayColor * 0.02;
+        // Guarantee a visible floor everywhere so no part of the sphere can
+        // ever fall to black and read as transparent.
+        color = max(color, dayColor * 0.10);
 
         gl_FragColor = vec4(color, 1.0);
       }
