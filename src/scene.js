@@ -373,11 +373,22 @@ function createEarthShaderMaterial(dayTex, nightTex, normalTex, specularTex, clo
           color += vec3(1.0, 0.98, 0.9) * spec * dayFactor * 0.9;
         }
 
+        // --- Atmospheric scattering at the terminator ---
+        // Warm Rayleigh/Mie sunset glow where the sun grazes the limb (NdotL
+        // near 0), fading into the day side — the orange→blue band that makes a
+        // real Earth photo read as a lit atmosphere, not a flat texture.
+        float termBand = exp(-NdotL * NdotL * 42.0);          // peak at terminator
+        float dayApproach = smoothstep(-0.25, 0.15, NdotL);   // day-facing only
+        vec3 sunsetColor = vec3(1.0, 0.42, 0.18);
+        color += sunsetColor * termBand * dayApproach * 0.22;
+        // A faint cool high-atmosphere haze across the lit hemisphere.
+        color += vec3(0.10, 0.16, 0.28) * dayFactor * 0.05;
+
         // --- Cloud self-shadow cast onto the surface (offset toward the sun) ---
         if (hasClouds > 0.5) {
-          vec2 shadowUV = vUv - 0.0015 * sunDir.xy;
+          vec2 shadowUV = vUv - 0.0022 * sunDir.xy;
           float cloudShadow = texture2D(cloudTexture, shadowUV).r;
-          color *= (1.0 - 0.35 * cloudShadow * dayFactor);
+          color *= (1.0 - 0.5 * cloudShadow * dayFactor);
         }
 
         // Guarantee a visible floor everywhere so no part of the sphere can
