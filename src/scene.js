@@ -106,11 +106,16 @@ function dampVec3(current, target, lambda, dt) {
 // foil) that reads as depth/layering under the instanced material's
 // vertexColors — while still multiplying by the per-category hue.
 function tintPart(geo, shade) {
-  const n = geo.attributes.position.count;
+  // Normalise to non-indexed so parts from indexed primitives (Box/Cylinder/
+  // Cone) merge cleanly with non-indexed polyhedra (Octahedron/Icosahedron/
+  // Tetrahedron) — mergeGeometries requires a consistent index state.
+  const g = geo.index ? geo.toNonIndexed() : geo;
+  if (g !== geo) geo.dispose();
+  const n = g.attributes.position.count;
   const col = new Float32Array(n * 3);
-  for (let i = 0; i < n; i++) { col[i * 3] = shade; col[i * 3 + 1] = shade; col[i * 3 + 2] = shade; }
-  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  return geo;
+  col.fill(shade);
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return g;
 }
 
 function buildSatelliteGlyphGeometry() {
