@@ -1914,7 +1914,7 @@ export class LunarScene {
     addRing(r * 0.5, h * 0.012);       // interstage
     addStage(r * 0.5, r * 0.34, h * 0.12);  // IU + CSM stack (taper)
 
-    // Nose cone / launch escape tip
+    // Nose cone (S-IVB forward / CSM) — conic
     const noseGeo = new THREE.ConeGeometry(r * 0.34, h * 0.16, 16);
     const noseMat = new THREE.MeshStandardMaterial({
       color: 0xffffff, emissive: 0x333333, emissiveIntensity: 0.25,
@@ -1925,30 +1925,93 @@ export class LunarScene {
     this._rocket.add(nose);
     this._disposables.push(noseGeo, noseMat);
 
-    // Engine nozzle (inverted cone) at the base
-    const nozzleGeo = new THREE.ConeGeometry(r * 0.8, h * 0.1, 12);
-    const nozzleMat = new THREE.MeshStandardMaterial({
-      color: 0x2a2a2a, roughness: 0.8, metalness: 0.7,
+    // Launch-escape tower: a thin lattice spike + tractor motor on the tip
+    // (the tall red needle atop every crewed Saturn V / Apollo stack).
+    const lesMat = new THREE.MeshStandardMaterial({
+      color: 0xcc2222, roughness: 0.5, metalness: 0.4,
+      emissive: 0x330000, emissiveIntensity: 0.2,
     });
-    const nozzle = new THREE.Mesh(nozzleGeo, nozzleMat);
-    nozzle.rotation.x = Math.PI; // inverted
-    nozzle.position.y = baseY - h * 0.04;
-    this._rocket.add(nozzle);
-    this._disposables.push(nozzleGeo, nozzleMat);
+    this._disposables.push(lesMat);
+    const lesTowerGeo = new THREE.CylinderGeometry(r * 0.04, r * 0.05, h * 0.14, 8);
+    const lesTower = new THREE.Mesh(lesTowerGeo, lesMat);
+    lesTower.position.y = nose.position.y + h * 0.14;
+    this._rocket.add(lesTower);
+    this._disposables.push(lesTowerGeo);
+    const lesMotorGeo = new THREE.CylinderGeometry(r * 0.09, r * 0.11, h * 0.05, 10);
+    const lesMotor = new THREE.Mesh(lesMotorGeo, lesMat);
+    lesMotor.position.y = lesTower.position.y + h * 0.09;
+    this._rocket.add(lesMotor);
+    this._disposables.push(lesMotorGeo);
 
-    // 4 fins at the base of the widest stage
-    const finGeo = new THREE.BoxGeometry(r * 0.15, h * 0.16, r * 2.6);
+    // --- Iconic Saturn V black roll-pattern markings (recognisable at a glance) ---
+    // White stages with black panels: a wide base band, four upper quadrant
+    // panels on stage 1, and a mid band. Built as thin greebles so no per-
+    // cylinder UV alignment is needed.
+    const blackMat = new THREE.MeshStandardMaterial({
+      color: 0x111114, roughness: 0.55, metalness: 0.35,
+    });
+    this._disposables.push(blackMat);
+    const addBand = (yc, hFrac, rad) => {
+      const geo = new THREE.CylinderGeometry(rad * 1.012, rad * 1.012, hFrac, 20);
+      const m = new THREE.Mesh(geo, blackMat);
+      m.position.y = yc;
+      this._rocket.add(m);
+      this._disposables.push(geo);
+    };
+    addBand(baseY + h * 0.03, h * 0.05, r);        // base band (S-IC bottom)
+    addBand(baseY + h * 0.28, h * 0.02, r);        // stage-1 upper band
+    // Four black quadrant panels on stage 1 (the classic roll pattern).
+    const panelGeo = new THREE.BoxGeometry(r * 0.9, h * 0.14, r * 0.06);
+    this._disposables.push(panelGeo);
+    for (let i = 0; i < 4; i++) {
+      const panel = new THREE.Mesh(panelGeo, blackMat);
+      const a = (i / 4) * TWO_PI + Math.PI / 4;
+      panel.position.set(Math.cos(a) * r * 0.99, baseY + h * 0.18, Math.sin(a) * r * 0.99);
+      panel.rotation.y = a;
+      this._rocket.add(panel);
+    }
+
+    // --- 5-engine F-1 cluster at the base (1 centre + 4 outboard) ---
+    const nozzleMat = new THREE.MeshStandardMaterial({
+      color: 0x1c1c20, roughness: 0.7, metalness: 0.8,
+      emissive: 0x0a0a0a, emissiveIntensity: 0.2,
+    });
+    this._disposables.push(nozzleMat);
+    const nozzleGeo = new THREE.ConeGeometry(r * 0.26, h * 0.11, 14, 1, true);
+    this._disposables.push(nozzleGeo);
+    const engineCap = new THREE.MeshStandardMaterial({ color: 0x2a2a30, roughness: 0.6, metalness: 0.85 });
+    this._disposables.push(engineCap);
+    const addEngine = (ex, ez) => {
+      const noz = new THREE.Mesh(nozzleGeo, nozzleMat);
+      noz.rotation.x = Math.PI; // bell opens downward
+      noz.position.set(ex, baseY - h * 0.05, ez);
+      this._rocket.add(noz);
+      // Injector plate cap above the bell
+      const capGeo = new THREE.CylinderGeometry(r * 0.16, r * 0.22, h * 0.03, 12);
+      const cap = new THREE.Mesh(capGeo, engineCap);
+      cap.position.set(ex, baseY + h * 0.005, ez);
+      this._rocket.add(cap);
+      this._disposables.push(capGeo);
+    };
+    addEngine(0, 0); // centre
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * TWO_PI;
+      addEngine(Math.cos(a) * r * 0.5, Math.sin(a) * r * 0.5); // outboard ring
+    }
+
+    // 4 stabilising fins between the outboard engines
+    const finGeo = new THREE.BoxGeometry(r * 0.12, h * 0.15, r * 2.6);
     const finMat = new THREE.MeshStandardMaterial({
-      color: 0xdddddd, roughness: 0.35, metalness: 0.4,
+      color: 0xe6e6e6, roughness: 0.35, metalness: 0.4,
     });
     this._disposables.push(finGeo, finMat);
     for (let i = 0; i < 4; i++) {
       const fin = new THREE.Mesh(finGeo, finMat);
-      const angle = (i / 4) * TWO_PI;
+      const angle = (i / 4) * TWO_PI + Math.PI / 4;
       fin.position.set(
-        Math.cos(angle) * r * 0.8,
-        baseY + h * 0.06,
-        Math.sin(angle) * r * 0.8,
+        Math.cos(angle) * r * 0.85,
+        baseY + h * 0.05,
+        Math.sin(angle) * r * 0.85,
       );
       fin.rotation.y = angle;
       this._rocket.add(fin);
