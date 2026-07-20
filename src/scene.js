@@ -25,7 +25,6 @@ const MOON_RADIUS = 0.2727; // 1737.4 / 6371
 const MOON_DISTANCE = 60.3; // ~384400 / 6371
 const EARTH_SEGMENTS = 128;
 const CLOUD_ROTATION_SPEED = 0.000035;
-const MOON_ORBIT_SPEED = 0.00005;
 const EARTH_AXIAL_TILT = 23.5 * (Math.PI / 180);
 const DEG_TO_RAD = Math.PI / 180;
 const TWO_PI = Math.PI * 2;
@@ -600,7 +599,6 @@ export class LunarScene {
     this._trajectoryCurve = null;
     this._landingMarker = null;
     this._launchMarker = null;
-    this._moonOrbitAngle = 0;
     this._externalMoonPos = false;
     this._issOrbitLine = null;
     this._debrisCloud = null;
@@ -907,11 +905,11 @@ export class LunarScene {
       this.moon = new THREE.Mesh(moonGeo, moonMat);
       this._disposables.push(moonMat);
     }
+    // Placeholder position only; main.js immediately drives the Moon to its
+    // accurate Meeus ephemeris position via setMoonPosition (and keeps it
+    // updated), so no synthetic orbit path or animation is used here.
     this.moon.position.set(MOON_DISTANCE, 0, 0);
     this.scene.add(this.moon);
-    
-    // Moon orbital path - bright yellow dashed ring
-    this._createMoonOrbitPath();
   }
 
   /**
@@ -965,58 +963,6 @@ export class LunarScene {
     } catch {
       return null; // e.g. canvas tainted — fall back to bumpMap only
     }
-  }
-
-  _createMoonOrbitPath() {
-    // This creates a placeholder ring. It will be updated when setMoonOrbitFromPositions is called.
-    const segments = 256;
-    const points = [];
-    const moonIncl = 5.145 * Math.PI / 180;
-    
-    for (let i = 0; i <= segments; i++) {
-      const angle = (i / segments) * Math.PI * 2;
-      const x = MOON_DISTANCE * Math.cos(angle);
-      const rawZ = MOON_DISTANCE * Math.sin(angle);
-      const y = rawZ * Math.sin(moonIncl);
-      const z = rawZ * Math.cos(moonIncl);
-      points.push(new THREE.Vector3(x, y, z));
-    }
-    
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-    const material = new THREE.LineDashedMaterial({
-      color: 0xFFFF00,
-      dashSize: 1.5,
-      gapSize: 0.8,
-      transparent: true,
-      opacity: 0.6,
-      depthTest: true,
-      depthWrite: false,
-    });
-    
-    this._moonOrbitLine = new THREE.Line(geometry, material);
-    this._moonOrbitLine.computeLineDistances();
-    this._moonOrbitLine.renderOrder = 1;
-    this.scene.add(this._moonOrbitLine);
-    this._disposables.push(geometry, material);
-  }
-
-  /**
-   * Update the Moon orbit ring to pass through actual computed Moon positions.
-   * Call this with an array of {x,y,z} positions computed from Meeus at regular
-   * intervals around the Moon's ~27.3-day orbit.
-   */
-  setMoonOrbitFromPositions(positions) {
-    if (!this._moonOrbitLine || !positions || positions.length < 10) return;
-    
-    const points = positions.map(p => new THREE.Vector3(p.x, p.y, p.z));
-    // Close the loop
-    points.push(points[0].clone());
-    
-    const newGeo = new THREE.BufferGeometry().setFromPoints(points);
-    this._moonOrbitLine.geometry.dispose();
-    this._moonOrbitLine.geometry = newGeo;
-    this._moonOrbitLine.computeLineDistances();
-    this._disposables.push(newGeo);
   }
 
   /**
@@ -2396,15 +2342,9 @@ export class LunarScene {
       this.clouds.rotation.y = (this.earth ? this.earth.rotation.y : 0) + this._cloudDrift;
     }
 
-    // Moon orbit (simple circular for default; overridden by external moonPosition)
-    this._moonOrbitAngle += MOON_ORBIT_SPEED * frameScale;
-    if (this.moon && !this._externalMoonPos) {
-      this.moon.position.set(
-        Math.cos(this._moonOrbitAngle) * MOON_DISTANCE,
-        0,
-        Math.sin(this._moonOrbitAngle) * MOON_DISTANCE,
-      );
-    }
+    // Moon position is driven entirely by main.js from the Meeus ephemeris
+    // (initial placement, periodic updates, and the arrival position of a
+    // selected launch window). No synthetic in-scene orbit is applied.
 
     // Update sun direction on earth / cloud / atmosphere shaders to match sunLight
     const sunDir = this.sunLight.position;

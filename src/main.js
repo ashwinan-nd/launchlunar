@@ -2388,16 +2388,6 @@ async function loadInitialOrbitalData() {
   const moonPosThree = eciToThreeJs(moonPos);
   scene.setMoonPosition(moonPosThree);
 
-  // Compute Moon's orbital path (positions every ~6.5 hours over 27.3 days)
-  const MOON_PERIOD_MS = 27.321661 * 86400 * 1000; // sidereal month in ms
-  const orbitPoints = [];
-  for (let i = 0; i < 100; i++) {
-    const t = now.getTime() + (i / 100) * MOON_PERIOD_MS;
-    const mp = getMoonPosition(new Date(t));
-    orbitPoints.push(eciToThreeJs(mp));
-  }
-  scene.setMoonOrbitFromPositions(orbitPoints);
-
   // Continuously update Moon position every 10 seconds using Meeus — but NOT while a
   // launch window/trajectory is active. In that case the Moon is pinned to the
   // window's arrival position so it stays at the end of the rendered trajectory.
